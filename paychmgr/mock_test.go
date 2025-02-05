@@ -13,7 +13,7 @@ import (
 	"github.com/filecoin-project/go-state-types/network"
 
 	"github.com/filecoin-project/lotus/api"
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/paych"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/lib/sigs"
@@ -63,7 +63,7 @@ func (sm *mockStateManager) setPaychState(a address.Address, actor *types.Actor,
 	sm.paychState[a] = mockPchState{actor, state}
 }
 
-func (sm *mockStateManager) ResolveToKeyAddress(ctx context.Context, addr address.Address, ts *types.TipSet) (address.Address, error) {
+func (sm *mockStateManager) ResolveToDeterministicAddress(ctx context.Context, addr address.Address, ts *types.TipSet) (address.Address, error) {
 	sm.lk.Lock()
 	defer sm.lk.Unlock()
 	keyAddr, ok := sm.accountState[addr]
@@ -250,5 +250,5 @@ func (pchapi *mockPaychAPI) addSigningKey(key []byte) {
 }
 
 func (pchapi *mockPaychAPI) StateNetworkVersion(ctx context.Context, tsk types.TipSetKey) (network.Version, error) {
-	return build.NewestNetworkVersion, nil
+	return buildconstants.TestNetworkVersion, nil
 }

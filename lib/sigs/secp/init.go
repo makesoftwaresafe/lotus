@@ -3,10 +3,10 @@ package secp
 import (
 	"fmt"
 
-	"github.com/minio/blake2b-simd"
+	"golang.org/x/crypto/blake2b"
 
 	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/go-crypto"
+	crypto "github.com/filecoin-project/go-crypto"
 	crypto2 "github.com/filecoin-project/go-state-types/crypto"
 
 	"github.com/filecoin-project/lotus/lib/sigs"

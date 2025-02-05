@@ -9,16 +9,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/filecoin-project/go-address"
 
 	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/types"
 )
 
 var (
-	BootstrapPeerThreshold = build.BootstrapPeerThreshold
+	BootstrapPeerThreshold = buildconstants.BootstrapPeerThreshold
 
 	RecentSyncBufferSize = 10
 	MaxSyncWorkers       = 5
@@ -92,6 +93,7 @@ type syncManager struct {
 var _ SyncManager = (*syncManager)(nil)
 
 type peerHead struct {
+	// Note: this doesn't _necessarily_ mean that p's head is ts, just that ts is a tipset that p sent to us
 	p  peer.ID
 	ts *types.TipSet
 }
@@ -109,6 +111,7 @@ type workerStatus struct {
 }
 
 // sync manager interface
+
 func NewSyncManager(sync SyncFunc) SyncManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &syncManager{
@@ -356,7 +359,7 @@ func (sm *syncManager) selectInitialSyncTarget() (*types.TipSet, error) {
 	return buckets.Heaviest(), nil
 }
 
-// adds a tipset to the potential sync targets; returns true if there is a a tipset to work on.
+// adds a tipset to the potential sync targets; returns true if there is a tipset to work on.
 // this could be either a restart, eg because there is no currently scheduled sync work or a worker
 // failed or a potential fork.
 func (sm *syncManager) addSyncTarget(ts *types.TipSet) (*types.TipSet, bool, error) {

@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 
 	"github.com/docker/go-units"
@@ -18,6 +17,7 @@ import (
 	"github.com/filecoin-project/go-state-types/network"
 
 	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/cmd/lotus-seed/seed"
@@ -27,7 +27,7 @@ import (
 var log = logging.Logger("lotus-seed")
 
 func main() {
-	logging.SetLogLevel("*", "INFO")
+	_ = logging.SetLogLevel("*", "INFO")
 
 	local := []*cli.Command{
 		genesisCmd,
@@ -39,7 +39,7 @@ func main() {
 	app := &cli.App{
 		Name:    "lotus-seed",
 		Usage:   "Seal sectors for genesis miner",
-		Version: build.UserVersion(),
+		Version: string(build.NodeUserVersion()),
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:  "sector-dir",
@@ -96,7 +96,7 @@ var preSealCmd = &cli.Command{
 		&cli.UintFlag{
 			Name:  "network-version",
 			Usage: "specify network version",
-			Value: uint(build.GenesisNetworkVersion),
+			Value: uint(buildconstants.GenesisNetworkVersion),
 		},
 	},
 	Action: func(c *cli.Context) error {
@@ -114,7 +114,7 @@ var preSealCmd = &cli.Command{
 		var k *types.KeyInfo
 		if c.String("key") != "" {
 			k = new(types.KeyInfo)
-			kh, err := ioutil.ReadFile(c.String("key"))
+			kh, err := os.ReadFile(c.String("key"))
 			if err != nil {
 				return err
 			}
@@ -133,12 +133,13 @@ var preSealCmd = &cli.Command{
 		}
 		sectorSize := abi.SectorSize(sectorSizeInt)
 
-		nv := build.GenesisNetworkVersion
+		nv := buildconstants.GenesisNetworkVersion
 		if c.IsSet("network-version") {
 			nv = network.Version(c.Uint64("network-version"))
 		}
 
-		spt, err := miner.SealProofTypeFromSectorSize(sectorSize, nv)
+		var variant = miner.SealProofVariant_Standard // there's little reason to have this for a seed.
+		spt, err := miner.SealProofTypeFromSectorSize(sectorSize, nv, variant)
 		if err != nil {
 			return err
 		}

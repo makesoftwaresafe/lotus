@@ -10,18 +10,23 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/builtin"
-	"github.com/filecoin-project/go-state-types/builtin/v8/miner"
 	"github.com/filecoin-project/go-state-types/exitcode"
 	"github.com/filecoin-project/go-statemachine"
 
 	"github.com/filecoin-project/lotus/api"
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
+	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/actors/policy"
 	"github.com/filecoin-project/lotus/chain/types"
 )
 
 func (m *Sealing) handleReplicaUpdate(ctx statemachine.Context, sector SectorInfo) error {
-	if err := checkPieces(ctx.Context(), m.maddr, sector, m.Api, true); err != nil { // Sanity check state
+	// if the sector ended up not having any deals, abort the upgrade
+	if !sector.hasData() {
+		return ctx.Send(SectorAbortUpgrade{xerrors.New("sector had no deals")})
+	}
+
+	if err := checkPieces(ctx.Context(), m.maddr, sector.SectorNumber, sector.Pieces, m.Api, true); err != nil { // Sanity check state
 		return handleErrors(ctx, err, sector)
 	}
 	out, err := m.sealer.ReplicaUpdate(sector.sealingCtx(ctx.Context()), m.minerSector(sector.SectorType, sector.SectorNumber), sector.pieceInfos())
@@ -52,8 +57,9 @@ func (m *Sealing) handleProveReplicaUpdate(ctx statemachine.Context, sector Sect
 		return nil
 	}
 	if !active {
-		log.Errorf("sector marked for upgrade %d no longer active, aborting upgrade", sector.SectorNumber)
-		return ctx.Send(SectorAbortUpgrade{})
+		err := xerrors.Errorf("sector marked for upgrade %d no longer active, aborting upgrade", sector.SectorNumber)
+		log.Errorf("%s", err)
+		return ctx.Send(SectorAbortUpgrade{err})
 	}
 
 	vanillaProofs, err := m.sealer.ProveReplicaUpdate1(sector.sealingCtx(ctx.Context()), m.minerSector(sector.SectorType, sector.SectorNumber), *sector.CommR, *sector.UpdateSealed, *sector.UpdateUnsealed)
@@ -61,7 +67,7 @@ func (m *Sealing) handleProveReplicaUpdate(ctx statemachine.Context, sector Sect
 		return ctx.Send(SectorProveReplicaUpdateFailed{xerrors.Errorf("prove replica update (1) failed: %w", err)})
 	}
 
-	if err := checkPieces(ctx.Context(), m.maddr, sector, m.Api, true); err != nil { // Sanity check state
+	if err := checkPieces(ctx.Context(), m.maddr, sector.SectorNumber, sector.Pieces, m.Api, true); err != nil { // Sanity check state
 		return handleErrors(ctx, err, sector)
 	}
 
@@ -76,14 +82,13 @@ func (m *Sealing) handleProveReplicaUpdate(ctx statemachine.Context, sector Sect
 }
 
 func (m *Sealing) handleSubmitReplicaUpdate(ctx statemachine.Context, sector SectorInfo) error {
-
 	ts, err := m.Api.ChainHead(ctx.Context())
 	if err != nil {
 		log.Errorf("handleSubmitReplicaUpdate: api error, not proceeding: %+v", err)
 		return nil
 	}
 
-	if err := checkReplicaUpdate(ctx.Context(), m.maddr, sector, ts.Key(), m.Api); err != nil {
+	if err := checkReplicaUpdate(ctx.Context(), m.maddr, sector, m.Api); err != nil {
 		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
 	}
 
@@ -92,29 +97,24 @@ func (m *Sealing) handleSubmitReplicaUpdate(ctx statemachine.Context, sector Sec
 		log.Errorf("handleSubmitReplicaUpdate: api error, not proceeding: %+v", err)
 		return nil
 	}
+
+	dlinfo, err := m.Api.StateMinerProvingDeadline(ctx.Context(), m.maddr, ts.Key())
+	if err != nil {
+		log.Errorf("handleSubmitReplicaUpdate: api error, not proceeding: %w", err)
+	}
+	// if sector's deadline is immutable wait in a non error state
+	// sector's deadline is immutable if it is the current deadline or the next deadline
+	if sl.Deadline == dlinfo.Index || (dlinfo.Index+1)%dlinfo.WPoStPeriodDeadlines == sl.Deadline {
+		return ctx.Send(SectorDeadlineImmutable{})
+	}
+
 	updateProof, err := sector.SectorType.RegisteredUpdateProof()
 	if err != nil {
 		log.Errorf("failed to get update proof type from seal proof: %+v", err)
 		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
 	}
-	enc := new(bytes.Buffer)
-	params := &miner.ProveReplicaUpdatesParams{
-		Updates: []miner.ReplicaUpdate{
-			{
-				SectorID:           sector.SectorNumber,
-				Deadline:           sl.Deadline,
-				Partition:          sl.Partition,
-				NewSealedSectorCID: *sector.UpdateSealed,
-				Deals:              sector.dealIDs(),
-				UpdateProofType:    updateProof,
-				ReplicaProof:       sector.ReplicaUpdateProof,
-			},
-		},
-	}
-	if err := params.MarshalCBOR(enc); err != nil {
-		log.Errorf("failed to serialize update replica params: %w", err)
-		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
-	}
+
+	// figure out from address and collateral
 
 	cfg, err := m.getConfig()
 	if err != nil {
@@ -123,31 +123,45 @@ func (m *Sealing) handleSubmitReplicaUpdate(ctx statemachine.Context, sector Sec
 
 	onChainInfo, err := m.Api.StateSectorGetInfo(ctx.Context(), m.maddr, sector.SectorNumber, ts.Key())
 	if err != nil {
-		log.Errorf("handleSubmitReplicaUpdate: api error, not proceeding: %+v", err)
-		return nil
+		log.Errorf("failed to get sector info: %+v", err)
+		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
 	}
-	sp, err := m.currentSealProof(ctx.Context())
-	if err != nil {
-		log.Errorf("sealer failed to return current seal proof not proceeding: %+v", err)
-		return nil
-	}
-	virtualPCI := miner.SectorPreCommitInfo{
-		SealProof:    sp,
-		SectorNumber: sector.SectorNumber,
-		SealedCID:    *sector.UpdateSealed,
-		//SealRandEpoch: 0,
-		DealIDs:    sector.dealIDs(),
-		Expiration: onChainInfo.Expiration,
-		//ReplaceCapacity: false,
-		//ReplaceSectorDeadline: 0,
-		//ReplaceSectorPartition: 0,
-		//ReplaceSectorNumber: 0,
+	if onChainInfo == nil {
+		log.Errorw("on chain info was nil", "sector", sector.SectorNumber)
+		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
 	}
 
-	collateral, err := m.Api.StateMinerInitialPledgeCollateral(ctx.Context(), m.maddr, virtualPCI, ts.Key())
+	duration := onChainInfo.Expiration - ts.Height()
+
+	ssize, err := sector.SectorType.SectorSize()
+	if err != nil {
+		return xerrors.Errorf("failed to resolve sector size for seal proof: %w", err)
+	}
+
+	var verifiedSize uint64
+	for _, piece := range sector.Pieces {
+		if piece.HasDealInfo() {
+			alloc, err := piece.GetAllocation(ctx.Context(), m.Api, ts.Key())
+			if err != nil || alloc == nil {
+				if err != nil {
+					log.Errorw("failed to get allocation", "error", err)
+				}
+				verifiedSize += uint64(piece.Piece().Size)
+			}
+		}
+	}
+
+	collateral, err := m.Api.StateMinerInitialPledgeForSector(ctx.Context(), duration, ssize, verifiedSize, ts.Key())
 	if err != nil {
 		return xerrors.Errorf("getting initial pledge collateral: %w", err)
 	}
+
+	log.Infow("submitting replica update",
+		"sector", sector.SectorNumber,
+		"verifiedSize", verifiedSize,
+		"totalPledge", types.FIL(collateral),
+		"initialPledge", types.FIL(onChainInfo.InitialPledge),
+		"toPledge", types.FIL(big.Sub(collateral, onChainInfo.InitialPledge)))
 
 	collateral = big.Sub(collateral, onChainInfo.InitialPledge)
 	if collateral.LessThan(big.Zero()) {
@@ -168,12 +182,43 @@ func (m *Sealing) handleSubmitReplicaUpdate(ctx statemachine.Context, sector Sec
 		return nil
 	}
 
-	from, _, err := m.addrSel(ctx.Context(), mi, api.CommitAddr, goodFunds, collateral)
+	from, _, err := m.addrSel.AddressFor(ctx.Context(), m.Api, mi, api.CommitAddr, goodFunds, collateral)
 	if err != nil {
 		log.Errorf("no good address to send replica update message from: %+v", err)
 		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
 	}
-	mcid, err := sendMsg(ctx.Context(), m.Api, from, m.maddr, builtin.MethodsMiner.ProveReplicaUpdates, collateral, big.Int(m.feeCfg.MaxCommitGasFee), enc.Bytes())
+
+	pams, err := m.processPieces(ctx.Context(), sector)
+	if err != nil {
+		log.Errorf("failed to process pieces: %+v", err)
+		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
+	}
+
+	params := &miner.ProveReplicaUpdates3Params{
+		SectorUpdates: []miner.SectorUpdateManifest{
+			{
+				Sector:       sector.SectorNumber,
+				Deadline:     sl.Deadline,
+				Partition:    sl.Partition,
+				NewSealedCID: *sector.UpdateSealed,
+				Pieces:       pams,
+			},
+		},
+		SectorProofs:     [][]byte{sector.ReplicaUpdateProof},
+		UpdateProofsType: updateProof,
+		//AggregateProof
+		//AggregateProofType
+		RequireActivationSuccess:   cfg.RequireActivationSuccessUpdate,
+		RequireNotificationSuccess: cfg.RequireNotificationSuccessUpdate,
+	}
+
+	enc := new(bytes.Buffer)
+	if err := params.MarshalCBOR(enc); err != nil {
+		log.Errorf("failed to serialize update replica params: %w", err)
+		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
+	}
+
+	mcid, err := sendMsg(ctx.Context(), m.Api, from, m.maddr, builtin.MethodsMiner.ProveReplicaUpdates3, collateral, big.Int(m.feeCfg.MaxCommitGasFee), enc.Bytes())
 	if err != nil {
 		log.Errorf("handleSubmitReplicaUpdate: error sending message: %+v", err)
 		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
@@ -182,13 +227,74 @@ func (m *Sealing) handleSubmitReplicaUpdate(ctx statemachine.Context, sector Sec
 	return ctx.Send(SectorReplicaUpdateSubmitted{Message: mcid})
 }
 
+func (m *Sealing) handleWaitMutable(ctx statemachine.Context, sector SectorInfo) error {
+	immutable := true
+	for immutable {
+		ts, err := m.Api.ChainHead(ctx.Context())
+		if err != nil {
+			log.Errorf("handleWaitMutable: api error, not proceeding: %+v", err)
+			return nil
+		}
+
+		sl, err := m.Api.StateSectorPartition(ctx.Context(), m.maddr, sector.SectorNumber, ts.Key())
+		if err != nil {
+			log.Errorf("handleWaitMutable: api error, not proceeding: %+v", err)
+			return nil
+		}
+
+		dlinfo, err := m.Api.StateMinerProvingDeadline(ctx.Context(), m.maddr, ts.Key())
+		if err != nil {
+			log.Errorf("handleWaitMutable: api error, not proceeding: %w", err)
+			return nil
+		}
+
+		sectorDeadlineOpen := sl.Deadline == dlinfo.Index
+		sectorDeadlineNext := (dlinfo.Index+1)%dlinfo.WPoStPeriodDeadlines == sl.Deadline
+		immutable = sectorDeadlineOpen || sectorDeadlineNext
+
+		// Sleep for immutable epochs
+		if immutable {
+			dlineEpochsRemaining := dlinfo.NextOpen() - ts.Height()
+			var targetEpoch abi.ChainEpoch
+			if sectorDeadlineOpen {
+				// sleep for remainder of deadline
+				targetEpoch = ts.Height() + dlineEpochsRemaining
+			} else {
+				// sleep for remainder of deadline and next one
+				targetEpoch = ts.Height() + dlineEpochsRemaining + dlinfo.WPoStChallengeWindow
+			}
+
+			atHeight := make(chan struct{})
+			err := m.events.ChainAt(ctx.Context(), func(context.Context, *types.TipSet, abi.ChainEpoch) error {
+				close(atHeight)
+				return nil
+			}, func(ctx context.Context, ts *types.TipSet) error {
+				log.Warn("revert in handleWaitMutable")
+				return nil
+			}, 5, targetEpoch)
+			if err != nil {
+				log.Errorf("handleWaitMutalbe: events error: api error, not proceeding: %w", err)
+				return nil
+			}
+
+			select {
+			case <-atHeight:
+			case <-ctx.Context().Done():
+				return ctx.Context().Err()
+			}
+		}
+
+	}
+	return ctx.Send(SectorDeadlineMutable{})
+}
+
 func (m *Sealing) handleReplicaUpdateWait(ctx statemachine.Context, sector SectorInfo) error {
 	if sector.ReplicaUpdateMessage == nil {
 		log.Errorf("handleReplicaUpdateWait: no replica update message cid recorded")
 		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
 	}
 
-	mw, err := m.Api.StateWaitMsg(ctx.Context(), *sector.ReplicaUpdateMessage, build.MessageConfidence, api.LookbackNoLimit, true)
+	mw, err := m.Api.StateWaitMsg(ctx.Context(), *sector.ReplicaUpdateMessage, buildconstants.MessageConfidence, api.LookbackNoLimit, true)
 	if err != nil {
 		log.Errorf("handleReplicaUpdateWait: failed to wait for message: %+v", err)
 		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
@@ -227,7 +333,11 @@ func (m *Sealing) handleFinalizeReplicaUpdate(ctx statemachine.Context, sector S
 		return xerrors.Errorf("getting sealing config: %w", err)
 	}
 
-	if err := m.sealer.FinalizeReplicaUpdate(sector.sealingCtx(ctx.Context()), m.minerSector(sector.SectorType, sector.SectorNumber), sector.keepUnsealedRanges(sector.Pieces, false, cfg.AlwaysKeepUnsealedCopy)); err != nil {
+	if err := m.sealer.ReleaseUnsealed(ctx.Context(), m.minerSector(sector.SectorType, sector.SectorNumber), sector.keepUnsealedRanges(sector.Pieces, false, cfg.AlwaysKeepUnsealedCopy)); err != nil {
+		return ctx.Send(SectorFinalizeFailed{xerrors.Errorf("release unsealed: %w", err)})
+	}
+
+	if err := m.sealer.FinalizeReplicaUpdate(sector.sealingCtx(ctx.Context()), m.minerSector(sector.SectorType, sector.SectorNumber)); err != nil {
 		return ctx.Send(SectorFinalizeFailed{xerrors.Errorf("finalize sector: %w", err)})
 	}
 
@@ -235,8 +345,12 @@ func (m *Sealing) handleFinalizeReplicaUpdate(ctx statemachine.Context, sector S
 }
 
 func (m *Sealing) handleUpdateActivating(ctx statemachine.Context, sector SectorInfo) error {
+	if sector.ReplicaUpdateMessage == nil {
+		return xerrors.Errorf("nil sector.ReplicaUpdateMessage!")
+	}
+
 	try := func() error {
-		mw, err := m.Api.StateWaitMsg(ctx.Context(), *sector.ReplicaUpdateMessage, build.MessageConfidence, api.LookbackNoLimit, true)
+		mw, err := m.Api.StateWaitMsg(ctx.Context(), *sector.ReplicaUpdateMessage, buildconstants.MessageConfidence, api.LookbackNoLimit, true)
 		if err != nil {
 			return err
 		}
@@ -253,7 +367,7 @@ func (m *Sealing) handleUpdateActivating(ctx statemachine.Context, sector Sector
 
 		lb := policy.GetWinningPoStSectorSetLookback(nv)
 
-		targetHeight := mw.Height + lb + InteractivePoRepConfidence
+		targetHeight := mw.Height + lb
 
 		return m.events.ChainAt(context.Background(), func(context.Context, *types.TipSet, abi.ChainEpoch) error {
 			return ctx.Send(SectorUpdateActive{})
@@ -297,6 +411,6 @@ func handleErrors(ctx statemachine.Context, err error, sector SectorInfo) error 
 	case *ErrExpiredDeals: // Probably not much we can do here, maybe re-pack the sector?
 		return ctx.Send(SectorDealsExpired{xerrors.Errorf("expired dealIDs in sector: %w", err)})
 	default:
-		return xerrors.Errorf("checkPieces sanity check error: %w", err)
+		return xerrors.Errorf("checkPieces sanity check error: %w (%+v)", err, err)
 	}
 }

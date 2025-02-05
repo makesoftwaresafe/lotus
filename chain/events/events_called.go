@@ -23,7 +23,8 @@ type triggerID = uint64
 type msgH = abi.ChainEpoch
 
 // triggerH is the block height at which the listener will be notified about the
-//  message (msgH+confidence)
+//
+//	message (msgH+confidence)
 type triggerH = abi.ChainEpoch
 
 type eventData interface{}
@@ -39,7 +40,8 @@ type EventHandler func(ctx context.Context, data eventData, prevTs, ts *types.Ti
 //
 // If `done` is true, timeout won't be triggered
 // If `more` is false, no messages will be sent to EventHandler (RevertHandler
-//  may still be called)
+//
+//	may still be called)
 type CheckFunc func(ctx context.Context, ts *types.TipSet) (done bool, more bool, err error)
 
 // Keep track of information for an event handler
@@ -67,7 +69,7 @@ type queuedEvent struct {
 // Manages chain head change events, which may be forward (new tipset added to
 // chain) or backward (chain branch discarded in favour of heavier branch)
 type hcEvents struct {
-	cs EventAPI
+	cs EventHelperAPI
 
 	lk     sync.Mutex
 	lastTs *types.TipSet
@@ -92,7 +94,7 @@ type hcEvents struct {
 	watcherEvents
 }
 
-func newHCEvents(api EventAPI, obs *observer) *hcEvents {
+func newHCEvents(api EventHelperAPI, obs *observer) *hcEvents {
 	e := &hcEvents{
 		cs:          api,
 		confQueue:   map[triggerH]map[msgH][]*queuedEvent{},
@@ -324,14 +326,14 @@ type headChangeAPI interface {
 
 // watcherEvents watches for a state change
 type watcherEvents struct {
-	cs    EventAPI
+	cs    EventHelperAPI
 	hcAPI headChangeAPI
 
 	lk       sync.RWMutex
 	matchers map[triggerID]StateMatchFunc
 }
 
-func newWatcherEvents(hcAPI headChangeAPI, cs EventAPI) watcherEvents {
+func newWatcherEvents(hcAPI headChangeAPI, cs EventHelperAPI) watcherEvents {
 	return watcherEvents{
 		cs:       cs,
 		hcAPI:    hcAPI,
@@ -375,31 +377,31 @@ type StateMatchFunc func(oldTs, newTs *types.TipSet) (bool, StateChange, error)
 // StateChanged registers a callback which is triggered when a specified state
 // change occurs or a timeout is reached.
 //
-// * `CheckFunc` callback is invoked immediately with a recent tipset, it
-//    returns two booleans - `done`, and `more`.
+//   - `CheckFunc` callback is invoked immediately with a recent tipset, it
+//     returns two booleans - `done`, and `more`.
 //
-//   * `done` should be true when some on-chain state change we are waiting
+//   - `done` should be true when some on-chain state change we are waiting
 //     for has happened. When `done` is set to true, timeout trigger is disabled.
 //
-//   * `more` should be false when we don't want to receive new notifications
+//   - `more` should be false when we don't want to receive new notifications
 //     through StateChangeHandler. Note that notifications may still be delivered to
 //     RevertHandler
 //
-// * `StateChangeHandler` is called when the specified state change was observed
-//    on-chain, and a confidence threshold was reached, or the specified `timeout`
-//    height was reached with no state change observed. When this callback is
-//    invoked on a timeout, `oldTs` and `states are set to nil.
-//    This callback returns a boolean specifying whether further notifications
-//    should be sent, like `more` return param from `CheckFunc` above.
+//   - `StateChangeHandler` is called when the specified state change was observed
+//     on-chain, and a confidence threshold was reached, or the specified `timeout`
+//     height was reached with no state change observed. When this callback is
+//     invoked on a timeout, `oldTs` and `states are set to nil.
+//     This callback returns a boolean specifying whether further notifications
+//     should be sent, like `more` return param from `CheckFunc` above.
 //
-// * `RevertHandler` is called after apply handler, when we drop the tipset
-//    containing the message. The tipset passed as the argument is the tipset
-//    that is being dropped. Note that the event dropped may be re-applied
-//    in a different tipset in small amount of time.
+//   - `RevertHandler` is called after apply handler, when we drop the tipset
+//     containing the message. The tipset passed as the argument is the tipset
+//     that is being dropped. Note that the event dropped may be re-applied
+//     in a different tipset in small amount of time.
 //
-// * `StateMatchFunc` is called against each tipset state. If there is a match,
-//   the state change is queued up until the confidence interval has elapsed (and
-//   `StateChangeHandler` is called)
+//   - `StateMatchFunc` is called against each tipset state. If there is a match,
+//     the state change is queued up until the confidence interval has elapsed (and
+//     `StateChangeHandler` is called)
 func (we *watcherEvents) StateChanged(check CheckFunc, scHnd StateChangeHandler, rev RevertHandler, confidence int, timeout abi.ChainEpoch, mf StateMatchFunc) error {
 	hnd := func(ctx context.Context, data eventData, prevTs, ts *types.TipSet, height abi.ChainEpoch) (bool, error) {
 		states, ok := data.(StateChange)
@@ -424,14 +426,14 @@ func (we *watcherEvents) StateChanged(check CheckFunc, scHnd StateChangeHandler,
 
 // messageEvents watches for message calls to actors
 type messageEvents struct {
-	cs    EventAPI
+	cs    EventHelperAPI
 	hcAPI headChangeAPI
 
 	lk       sync.RWMutex
 	matchers map[triggerID]MsgMatchFunc
 }
 
-func newMessageEvents(hcAPI headChangeAPI, cs EventAPI) messageEvents {
+func newMessageEvents(hcAPI headChangeAPI, cs EventHelperAPI) messageEvents {
 	return messageEvents{
 		cs:       cs,
 		hcAPI:    hcAPI,
@@ -503,33 +505,34 @@ type MsgHandler func(msg *types.Message, rec *types.MessageReceipt, ts *types.Ti
 type MsgMatchFunc func(msg *types.Message) (matched bool, err error)
 
 // Called registers a callback which is triggered when a specified method is
-//  called on an actor, or a timeout is reached.
 //
-// * `CheckFunc` callback is invoked immediately with a recent tipset, it
-//    returns two booleans - `done`, and `more`.
+//		called on an actor, or a timeout is reached.
 //
-//   * `done` should be true when some on-chain action we are waiting for has
-//     happened. When `done` is set to true, timeout trigger is disabled.
+//	  - `CheckFunc` callback is invoked immediately with a recent tipset, it
+//	    returns two booleans - `done`, and `more`.
 //
-//   * `more` should be false when we don't want to receive new notifications
-//     through MsgHandler. Note that notifications may still be delivered to
-//     RevertHandler
+//	  - `done` should be true when some on-chain action we are waiting for has
+//	    happened. When `done` is set to true, timeout trigger is disabled.
 //
-// * `MsgHandler` is called when the specified event was observed on-chain,
-//    and a confidence threshold was reached, or the specified `timeout` height
-//    was reached with no events observed. When this callback is invoked on a
-//    timeout, `msg` is set to nil. This callback returns a boolean specifying
-//    whether further notifications should be sent, like `more` return param
-//    from `CheckFunc` above.
+//	  - `more` should be false when we don't want to receive new notifications
+//	    through MsgHandler. Note that notifications may still be delivered to
+//	    RevertHandler
 //
-// * `RevertHandler` is called after apply handler, when we drop the tipset
-//    containing the message. The tipset passed as the argument is the tipset
-//    that is being dropped. Note that the message dropped may be re-applied
-//    in a different tipset in small amount of time.
+//	  - `MsgHandler` is called when the specified event was observed on-chain,
+//	    and a confidence threshold was reached, or the specified `timeout` height
+//	    was reached with no events observed. When this callback is invoked on a
+//	    timeout, `msg` is set to nil. This callback returns a boolean specifying
+//	    whether further notifications should be sent, like `more` return param
+//	    from `CheckFunc` above.
 //
-// * `MsgMatchFunc` is called against each message. If there is a match, the
-//   message is queued up until the confidence interval has elapsed (and
-//   `MsgHandler` is called)
+//	  - `RevertHandler` is called after apply handler, when we drop the tipset
+//	    containing the message. The tipset passed as the argument is the tipset
+//	    that is being dropped. Note that the message dropped may be re-applied
+//	    in a different tipset in small amount of time.
+//
+//	  - `MsgMatchFunc` is called against each message. If there is a match, the
+//	    message is queued up until the confidence interval has elapsed (and
+//	    `MsgHandler` is called)
 func (me *messageEvents) Called(ctx context.Context, check CheckFunc, msgHnd MsgHandler, rev RevertHandler, confidence int, timeout abi.ChainEpoch, mf MsgMatchFunc) error {
 	hnd := func(ctx context.Context, data eventData, prevTs, ts *types.TipSet, height abi.ChainEpoch) (bool, error) {
 		msg, ok := data.(*types.Message)
@@ -551,7 +554,7 @@ func (me *messageEvents) Called(ctx context.Context, check CheckFunc, msgHnd Msg
 
 	id, err := me.hcAPI.onHeadChanged(ctx, check, hnd, rev, confidence, timeout)
 	if err != nil {
-		return err
+		return xerrors.Errorf("on head changed error: %w", err)
 	}
 
 	me.lk.Lock()

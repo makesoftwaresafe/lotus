@@ -1,20 +1,26 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"os"
+	"text/tabwriter"
 
 	"github.com/ipfs/go-cid"
+	cbor "github.com/ipfs/go-ipld-cbor"
 	"github.com/ipld/go-car"
 	mh "github.com/multiformats/go-multihash"
 	"github.com/urfave/cli/v2"
+	cbg "github.com/whyrusleeping/cbor-gen"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-state-types/abi"
 
 	"github.com/filecoin-project/lotus/blockstore"
+	"github.com/filecoin-project/lotus/chain/actors"
+	"github.com/filecoin-project/lotus/chain/actors/adt"
 )
 
 var cidCmd = &cli.Command{
@@ -22,7 +28,43 @@ var cidCmd = &cli.Command{
 	Usage: "Cid command",
 	Subcommands: cli.Commands{
 		cidIdCmd,
-		cidFromCarCmd,
+		inspectBundleCmd,
+		cborCid,
+		cidBytes,
+	},
+}
+
+var cidBytes = &cli.Command{
+	Name:      "bytes",
+	Usage:     "cid bytes",
+	ArgsUsage: "[cid]",
+	Action: func(cctx *cli.Context) error {
+		c, err := cid.Decode(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+		// Add in the troublesome zero byte prefix
+		fmt.Printf("00%x\n", c.Bytes())
+		return nil
+	},
+}
+
+var cborCid = &cli.Command{
+	Name:      "cbor",
+	Usage:     "Serialize cid to cbor",
+	ArgsUsage: "[cid]",
+	Action: func(cctx *cli.Context) error {
+		c, err := cid.Decode(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+		cbgc := cbg.CborCid(c)
+		buf := bytes.NewBuffer(make([]byte, 0))
+		if err := cbgc.MarshalCBOR(buf); err != nil {
+			return err
+		}
+		fmt.Printf("%x\n", buf.Bytes())
+		return nil
 	},
 }
 
@@ -90,9 +132,9 @@ var cidIdCmd = &cli.Command{
 	},
 }
 
-var cidFromCarCmd = &cli.Command{
-	Name:      "manifest-cid-from-car",
-	Usage:     "Get the manifest CID from a car file",
+var inspectBundleCmd = &cli.Command{
+	Name:      "inspect-bundle",
+	Usage:     "Get the manifest CID from a car file, as well as the actor code CIDs",
 	ArgsUsage: "[path]",
 	Action: func(cctx *cli.Context) error {
 		ctx := cctx.Context
@@ -104,6 +146,7 @@ var cidFromCarCmd = &cli.Command{
 		}
 
 		bs := blockstore.NewMemory()
+		wrapBs := adt.WrapStore(ctx, cbor.NewCborStore(bs))
 
 		hdr, err := car.LoadCar(ctx, bs, f)
 		if err != nil {
@@ -114,6 +157,19 @@ var cidFromCarCmd = &cli.Command{
 
 		fmt.Printf("Manifest CID: %s\n", manifestCid.String())
 
-		return nil
+		entries, err := actors.ReadManifest(ctx, wrapBs, manifestCid)
+		if err != nil {
+			return xerrors.Errorf("error loading manifest: %w", err)
+		}
+
+		tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+		_, _ = fmt.Fprintln(tw, "\nActor\tCID\t")
+
+		for name, cid := range entries {
+			_, _ = fmt.Fprintf(tw, "%v\t%v\n", name, cid)
+
+		}
+
+		return tw.Flush()
 	},
 }

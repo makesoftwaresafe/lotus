@@ -1,4 +1,3 @@
-//stm: #unit
 package sealer
 
 import (
@@ -19,6 +18,7 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 	prooftypes "github.com/filecoin-project/go-state-types/proof"
 
+	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/storage/paths"
 	"github.com/filecoin-project/lotus/storage/sealer/fsutil"
 	"github.com/filecoin-project/lotus/storage/sealer/sealtasks"
@@ -67,6 +67,10 @@ type schedTestWorker struct {
 	ignoreResources bool
 }
 
+func (s *schedTestWorker) DownloadSectorData(ctx context.Context, sector storiface.SectorRef, finalized bool, src map[storiface.SectorFileType]storiface.SectorLocation) (storiface.CallID, error) {
+	panic("implement me")
+}
+
 func (s *schedTestWorker) DataCid(ctx context.Context, pieceSize abi.UnpaddedPieceSize, pieceData storiface.Data) (storiface.CallID, error) {
 	panic("implement me")
 }
@@ -87,11 +91,11 @@ func (s *schedTestWorker) SealCommit2(ctx context.Context, sector storiface.Sect
 	panic("implement me")
 }
 
-func (s *schedTestWorker) FinalizeSector(ctx context.Context, sector storiface.SectorRef, keepUnsealed []storiface.Range) (storiface.CallID, error) {
+func (s *schedTestWorker) FinalizeSector(ctx context.Context, sector storiface.SectorRef) (storiface.CallID, error) {
 	panic("implement me")
 }
 
-func (s *schedTestWorker) ReleaseUnsealed(ctx context.Context, sector storiface.SectorRef, safeToFree []storiface.Range) (storiface.CallID, error) {
+func (s *schedTestWorker) ReleaseUnsealed(ctx context.Context, sector storiface.SectorRef, keepUnsealed []storiface.Range) (storiface.CallID, error) {
 	panic("implement me")
 }
 
@@ -123,7 +127,7 @@ func (s *schedTestWorker) GenerateSectorKeyFromData(ctx context.Context, sector 
 	panic("implement me")
 }
 
-func (s *schedTestWorker) FinalizeReplicaUpdate(ctx context.Context, sector storiface.SectorRef, keepUnsealed []storiface.Range) (storiface.CallID, error) {
+func (s *schedTestWorker) FinalizeReplicaUpdate(ctx context.Context, sector storiface.SectorRef) (storiface.CallID, error) {
 	panic("implement me")
 }
 
@@ -182,7 +186,7 @@ func (s *schedTestWorker) Close() error {
 
 var _ Worker = &schedTestWorker{}
 
-func addTestWorker(t *testing.T, sched *Scheduler, index *paths.Index, name string, taskTypes map[sealtasks.TaskType]struct{}, resources storiface.WorkerResources, ignoreResources bool) {
+func addTestWorker(t *testing.T, sched *Scheduler, index *paths.MemIndex, name string, taskTypes map[sealtasks.TaskType]struct{}, resources storiface.WorkerResources, ignoreResources bool) {
 	w := &schedTestWorker{
 		name:      name,
 		taskTypes: taskTypes,
@@ -222,17 +226,16 @@ func addTestWorker(t *testing.T, sched *Scheduler, index *paths.Index, name stri
 }
 
 func TestSchedStartStop(t *testing.T) {
-	sched, err := newScheduler("")
+	sched, err := newScheduler(context.Background(), "")
 	require.NoError(t, err)
 	go sched.runSched()
 
-	addTestWorker(t, sched, paths.NewIndex(), "fred", nil, decentWorkerResources, false)
+	addTestWorker(t, sched, paths.NewMemIndex(nil), "fred", nil, decentWorkerResources, false)
 
 	require.NoError(t, sched.Close(context.TODO()))
 }
 
 func TestSched(t *testing.T) {
-	//stm: @WORKER_JOBS_001
 	storiface.ParallelNum = 1
 	storiface.ParallelDenom = 1
 
@@ -259,17 +262,17 @@ func TestSched(t *testing.T) {
 		wg sync.WaitGroup
 	}
 
-	type task func(*testing.T, *Scheduler, *paths.Index, *runMeta)
+	type task func(*testing.T, *Scheduler, *paths.MemIndex, *runMeta)
 
 	sched := func(taskName, expectWorker string, sid abi.SectorNumber, taskType sealtasks.TaskType) task {
 		_, _, l, _ := runtime.Caller(1)
 		_, _, l2, _ := runtime.Caller(2)
 
-		return func(t *testing.T, sched *Scheduler, index *paths.Index, rm *runMeta) {
+		return func(t *testing.T, sched *Scheduler, index *paths.MemIndex, rm *runMeta) {
 			done := make(chan struct{})
 			rm.done[taskName] = done
 
-			sel := newAllocSelector(index, storiface.FTCache, storiface.PathSealing)
+			sel := newAllocSelector(index, storiface.FTCache, storiface.PathSealing, abi.ActorID(1000))
 
 			rm.wg.Add(1)
 			go func() {
@@ -283,25 +286,30 @@ func TestSched(t *testing.T) {
 					ProofType: spt,
 				}
 
-				err := sched.Schedule(ctx, sectorRef, taskType, sel, func(ctx context.Context, w Worker) error {
-					wi, err := w.Info(ctx)
-					require.NoError(t, err)
+				prep := PrepareAction{
+					Action: func(ctx context.Context, w Worker) error {
+						wi, err := w.Info(ctx)
+						require.NoError(t, err)
 
-					require.Equal(t, expectWorker, wi.Hostname)
+						require.Equal(t, expectWorker, wi.Hostname)
 
-					log.Info("IN  ", taskName)
+						log.Info("IN  ", taskName)
 
-					for {
-						_, ok := <-done
-						if !ok {
-							break
+						for {
+							_, ok := <-done
+							if !ok {
+								break
+							}
 						}
-					}
 
-					log.Info("OUT ", taskName)
+						log.Info("OUT ", taskName)
 
-					return nil
-				}, noopAction)
+						return nil
+					},
+					PrepType: taskType,
+				}
+
+				err := sched.Schedule(ctx, sectorRef, taskType, sel, prep, noopAction)
 				if err != context.Canceled {
 					require.NoError(t, err, fmt.Sprint(l, l2))
 				}
@@ -314,7 +322,7 @@ func TestSched(t *testing.T) {
 	taskStarted := func(name string) task {
 		_, _, l, _ := runtime.Caller(1)
 		_, _, l2, _ := runtime.Caller(2)
-		return func(t *testing.T, sched *Scheduler, index *paths.Index, rm *runMeta) {
+		return func(t *testing.T, sched *Scheduler, index *paths.MemIndex, rm *runMeta) {
 			select {
 			case rm.done[name] <- struct{}{}:
 			case <-ctx.Done():
@@ -326,7 +334,7 @@ func TestSched(t *testing.T) {
 	taskDone := func(name string) task {
 		_, _, l, _ := runtime.Caller(1)
 		_, _, l2, _ := runtime.Caller(2)
-		return func(t *testing.T, sched *Scheduler, index *paths.Index, rm *runMeta) {
+		return func(t *testing.T, sched *Scheduler, index *paths.MemIndex, rm *runMeta) {
 			select {
 			case rm.done[name] <- struct{}{}:
 			case <-ctx.Done():
@@ -339,7 +347,7 @@ func TestSched(t *testing.T) {
 	taskNotScheduled := func(name string) task {
 		_, _, l, _ := runtime.Caller(1)
 		_, _, l2, _ := runtime.Caller(2)
-		return func(t *testing.T, sched *Scheduler, index *paths.Index, rm *runMeta) {
+		return func(t *testing.T, sched *Scheduler, index *paths.MemIndex, rm *runMeta) {
 			select {
 			case rm.done[name] <- struct{}{}:
 				t.Fatal("not expected", l, l2)
@@ -350,9 +358,9 @@ func TestSched(t *testing.T) {
 
 	testFunc := func(workers []workerSpec, tasks []task) func(t *testing.T) {
 		return func(t *testing.T) {
-			index := paths.NewIndex()
+			index := paths.NewMemIndex(nil)
 
-			sched, err := newScheduler("")
+			sched, err := newScheduler(ctx, "")
 			require.NoError(t, err)
 			sched.testSync = make(chan struct{})
 
@@ -379,7 +387,7 @@ func TestSched(t *testing.T) {
 	}
 
 	multTask := func(tasks ...task) task {
-		return func(t *testing.T, s *Scheduler, index *paths.Index, meta *runMeta) {
+		return func(t *testing.T, s *Scheduler, index *paths.MemIndex, meta *runMeta) {
 			for _, tsk := range tasks {
 				tsk(t, s, index, meta)
 			}
@@ -493,7 +501,7 @@ func TestSched(t *testing.T) {
 	}
 
 	diag := func() task {
-		return func(t *testing.T, s *Scheduler, index *paths.Index, meta *runMeta) {
+		return func(t *testing.T, s *Scheduler, index *paths.MemIndex, meta *runMeta) {
 			time.Sleep(20 * time.Millisecond)
 			for _, request := range s.diag().Requests {
 				log.Infof("!!! sDIAG: sid(%d) task(%s)", request.Sector.Number, request.TaskType)
@@ -583,17 +591,27 @@ func TestSched(t *testing.T) {
 
 type slowishSelector bool
 
-func (s slowishSelector) Ok(ctx context.Context, task sealtasks.TaskType, spt abi.RegisteredSealProof, a *WorkerHandle) (bool, bool, error) {
-	time.Sleep(200 * time.Microsecond)
+func (s slowishSelector) Ok(ctx context.Context, task sealtasks.TaskType, spt abi.RegisteredSealProof, a SchedWorker) (bool, bool, error) {
+	// note: we don't care about output here, just the time those calls take
+	// (selector Ok/Cmp is called in the scheduler)
+	_, _ = a.Paths(ctx)
+	_, _ = a.TaskTypes(ctx)
 	return bool(s), false, nil
 }
 
-func (s slowishSelector) Cmp(ctx context.Context, task sealtasks.TaskType, a, b *WorkerHandle) (bool, error) {
-	time.Sleep(100 * time.Microsecond)
+func (s slowishSelector) Cmp(ctx context.Context, task sealtasks.TaskType, a, b SchedWorker) (bool, error) {
+	// note: we don't care about output here, just the time those calls take
+	// (selector Ok/Cmp is called in the scheduler)
+	_, _ = a.Paths(ctx)
 	return true, nil
 }
 
 var _ WorkerSelector = slowishSelector(true)
+
+type tw struct {
+	api.Worker
+	io.Closer
+}
 
 func BenchmarkTrySched(b *testing.B) {
 	logging.SetAllLoggers(logging.LevelInfo)
@@ -605,16 +623,27 @@ func BenchmarkTrySched(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
 
-				sched, err := newScheduler("")
+				var whnd api.WorkerStruct
+				whnd.Internal.TaskTypes = func(p0 context.Context) (map[sealtasks.TaskType]struct{}, error) {
+					time.Sleep(100 * time.Microsecond)
+					return nil, nil
+				}
+				whnd.Internal.Paths = func(p0 context.Context) ([]storiface.StoragePath, error) {
+					time.Sleep(100 * time.Microsecond)
+					return nil, nil
+				}
+
+				sched, err := newScheduler(ctx, "")
 				require.NoError(b, err)
 				sched.Workers[storiface.WorkerID{}] = &WorkerHandle{
-					workerRpc: nil,
+					workerRpc: &tw{Worker: &whnd},
 					Info: storiface.WorkerInfo{
 						Hostname:  "t",
 						Resources: decentWorkerResources,
 					},
-					preparing: NewActiveResources(),
-					active:    NewActiveResources(),
+					Enabled:   true,
+					preparing: NewActiveResources(newTaskCounter()),
+					active:    NewActiveResources(newTaskCounter()),
 				}
 
 				for i := 0; i < windows; i++ {
@@ -659,7 +688,7 @@ func TestWindowCompact(t *testing.T) {
 
 			for _, windowTasks := range start {
 				window := &SchedWindow{
-					Allocated: *NewActiveResources(),
+					Allocated: *NewActiveResources(newTaskCounter()),
 				}
 
 				for _, task := range windowTasks {
@@ -667,7 +696,7 @@ func TestWindowCompact(t *testing.T) {
 						TaskType: task,
 						Sector:   storiface.SectorRef{ProofType: spt},
 					})
-					window.Allocated.Add(task.SealTask(spt), wh.Info.Resources, storiface.ResourceTable[task][spt])
+					window.Allocated.Add(uuid.UUID{}, task.SealTask(spt), wh.Info.Resources, storiface.ResourceTable[task][spt])
 				}
 
 				wh.activeWindows = append(wh.activeWindows, window)
@@ -682,11 +711,11 @@ func TestWindowCompact(t *testing.T) {
 			require.Equal(t, len(start)-len(expect), -sw.windowsRequested)
 
 			for wi, tasks := range expect {
-				expectRes := NewActiveResources()
+				expectRes := NewActiveResources(newTaskCounter())
 
 				for ti, task := range tasks {
 					require.Equal(t, task, wh.activeWindows[wi].Todo[ti].TaskType, "%d, %d", wi, ti)
-					expectRes.Add(task.SealTask(spt), wh.Info.Resources, storiface.ResourceTable[task][spt])
+					expectRes.Add(uuid.UUID{}, task.SealTask(spt), wh.Info.Resources, storiface.ResourceTable[task][spt])
 				}
 
 				require.Equal(t, expectRes.cpuUse, wh.activeWindows[wi].Allocated.cpuUse, "%d", wi)

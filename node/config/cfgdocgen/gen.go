@@ -2,14 +2,13 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"sort"
 	"strings"
 )
 
 func run() error {
-	tfb, err := ioutil.ReadFile("./node/config/types.go")
+	tfb, err := os.ReadFile("./node/config/types.go")
 	if err != nil {
 		return err
 	}
@@ -53,7 +52,7 @@ func run() error {
 				continue
 			}
 		case stType:
-			if strings.HasPrefix(line, "// ") {
+			if strings.HasPrefix(line, "//") {
 				cline := strings.TrimSpace(strings.TrimPrefix(line, "//"))
 				currentComment = append(currentComment, cline)
 				continue
@@ -74,6 +73,11 @@ func run() error {
 
 			name := f[0]
 			typ := f[1]
+
+			if len(comment) > 0 && strings.HasPrefix(comment[0], fmt.Sprintf("%s is DEPRECATED", name)) {
+				// don't document deprecated fields
+				continue
+			}
 
 			out[currentType] = append(out[currentType], field{
 				Name:    name,
@@ -105,7 +109,7 @@ var Doc = map[string][]DocField{
 	for _, typeName := range outt {
 		typ := out[typeName]
 
-		fmt.Printf("\t\"%s\": []DocField{\n", typeName)
+		fmt.Printf("\t\"%s\": {\n", typeName)
 
 		for _, f := range typ {
 			fmt.Println("\t\t{")
@@ -125,7 +129,7 @@ var Doc = map[string][]DocField{
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Println(err.Error())
+		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
 }

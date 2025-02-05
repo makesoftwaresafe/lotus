@@ -20,6 +20,8 @@ type Config struct {
 
 	PreferNewSectorsForDeals bool
 
+	MinUpgradeSectorExpiration uint64
+
 	MaxUpgradingSectors uint64
 
 	MakeNewSectorForDeals bool
@@ -40,7 +42,6 @@ type Config struct {
 	AvailableBalanceBuffer     abi.TokenAmount
 	DisableCollateralFallback  bool
 
-	BatchPreCommits     bool
 	MaxPreCommitBatch   int
 	PreCommitBatchWait  time.Duration
 	PreCommitBatchSlack time.Duration
@@ -54,7 +55,16 @@ type Config struct {
 	AggregateAboveBaseFee      abi.TokenAmount
 	BatchPreCommitAboveBaseFee abi.TokenAmount
 
+	MaxSectorProveCommitsSubmittedPerEpoch uint64
+
 	TerminateBatchMax  uint64
 	TerminateBatchMin  uint64
 	TerminateBatchWait time.Duration
+
+	UseSyntheticPoRep bool
+
+	RequireActivationSuccess         bool
+	RequireActivationSuccessUpdate   bool
+	RequireNotificationSuccess       bool
+	RequireNotificationSuccessUpdate bool
 }

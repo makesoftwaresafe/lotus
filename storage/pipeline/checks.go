@@ -4,20 +4,24 @@ import (
 	"bytes"
 	"context"
 
+	"github.com/ipfs/go-cid"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/go-commp-utils/zerocomm"
+	"github.com/filecoin-project/go-commp-utils/v2/zerocomm"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/crypto"
 	prooftypes "github.com/filecoin-project/go-state-types/proof"
 
 	"github.com/filecoin-project/lotus/chain/actors/policy"
+	"github.com/filecoin-project/lotus/chain/proofs"
 	"github.com/filecoin-project/lotus/chain/types"
 )
 
 // TODO: For now we handle this by halting state execution, when we get jsonrpc reconnecting
-//  We should implement some wait-for-api logic
+//
+//	We should implement some wait-for-api logic
+
 type ErrApi struct{ error }
 
 type ErrNoDeals struct{ error }
@@ -39,70 +43,121 @@ type ErrCommitWaitFailed struct{ error }
 type ErrBadRU struct{ error }
 type ErrBadPR struct{ error }
 
-func checkPieces(ctx context.Context, maddr address.Address, si SectorInfo, api SealingAPI, mustHaveDeals bool) error {
+func checkPieces(ctx context.Context, maddr address.Address, sn abi.SectorNumber, pieces []SafeSectorPiece, api SealingAPI, mustHaveDeals bool) error {
 	ts, err := api.ChainHead(ctx)
 	if err != nil {
 		return &ErrApi{xerrors.Errorf("getting chain head: %w", err)}
 	}
 
 	dealCount := 0
+	var offset abi.PaddedPieceSize
 
-	for i, p := range si.Pieces {
-		// if no deal is associated with the piece, ensure that we added it as
-		// filler (i.e. ensure that it has a zero PieceCID)
-		if p.DealInfo == nil {
-			exp := zerocomm.ZeroPieceCommitment(p.Piece.Size.Unpadded())
-			if !p.Piece.PieceCID.Equals(exp) {
-				return &ErrInvalidPiece{xerrors.Errorf("sector %d piece %d had non-zero PieceCID %+v", si.SectorNumber, i, p.Piece.PieceCID)}
-			}
-			continue
+	for i, p := range pieces {
+		p, i := p, i
+
+		// check that the piece is correctly aligned
+		if offset%p.Piece().Size != 0 {
+			return &ErrInvalidPiece{xerrors.Errorf("sector %d piece %d is not aligned: size=%xh offset=%xh off-by=%xh", sn, i, p.Piece().Size, offset, offset%p.Piece().Size)}
 		}
+		offset += p.Piece().Size
 
-		dealCount++
+		err := p.handleDealInfo(handleDealInfoParams{
+			FillerHandler: func(pi UniversalPieceInfo) error {
+				// if no deal is associated with the piece, ensure that we added it as
+				// filler (i.e. ensure that it has a zero PieceCID)
 
-		deal, err := api.StateMarketStorageDeal(ctx, p.DealInfo.DealID, ts.Key())
+				exp := zerocomm.ZeroPieceCommitment(p.Piece().Size.Unpadded())
+				if !p.Piece().PieceCID.Equals(exp) {
+					return &ErrInvalidPiece{xerrors.Errorf("sector %d piece %d had non-zero PieceCID %+v", sn, i, p.Piece().PieceCID)}
+				}
+
+				return nil
+			},
+			BuiltinMarketHandler: func(pi UniversalPieceInfo) error {
+				dealCount++
+
+				deal, err := api.StateMarketStorageDeal(ctx, p.Impl().DealID, ts.Key())
+				if err != nil {
+					return &ErrInvalidDeals{xerrors.Errorf("getting deal %d for piece %d: %w", p.Impl().DealID, i, err)}
+				}
+
+				if deal.Proposal.Provider != maddr {
+					return &ErrInvalidDeals{xerrors.Errorf("piece %d (of %d) of sector %d refers deal %d with wrong provider: %s != %s", i, len(pieces), sn, p.Impl().DealID, deal.Proposal.Provider, maddr)}
+				}
+
+				if deal.Proposal.PieceCID != p.Piece().PieceCID {
+					return &ErrInvalidDeals{xerrors.Errorf("piece %d (of %d) of sector %d refers deal %d with wrong PieceCID: %s != %s", i, len(pieces), sn, p.Impl().DealID, p.Impl().DealProposal.PieceCID, deal.Proposal.PieceCID)}
+				}
+
+				if p.Piece().Size != deal.Proposal.PieceSize {
+					return &ErrInvalidDeals{xerrors.Errorf("piece %d (of %d) of sector %d refers deal %d with different size: %d != %d", i, len(pieces), sn, p.Impl().DealID, p.Piece().Size, deal.Proposal.PieceSize)}
+				}
+
+				if ts.Height() >= deal.Proposal.StartEpoch {
+					return &ErrExpiredDeals{xerrors.Errorf("piece %d (of %d) of sector %d refers expired deal %d - should start at %d, head %d", i, len(pieces), sn, p.Impl().DealID, deal.Proposal.StartEpoch, ts.Height())}
+				}
+
+				return nil
+			},
+			DDOHandler: func(pi UniversalPieceInfo) error {
+				dealCount++
+
+				// try to get allocation to see if that still works
+				all, err := pi.GetAllocation(ctx, api, ts.Key())
+				if err != nil {
+					return xerrors.Errorf("getting deal %d allocation: %w", p.Impl().DealID, err)
+				}
+				if all != nil {
+					mid, err := address.IDFromAddress(maddr)
+					if err != nil {
+						return xerrors.Errorf("getting miner id: %w", err)
+					}
+
+					if all.Provider != abi.ActorID(mid) {
+						return xerrors.Errorf("allocation provider doesn't match miner")
+					}
+
+					if ts.Height() >= all.Expiration {
+						return &ErrExpiredDeals{xerrors.Errorf("piece allocation %d (of %d) of sector %d refers expired deal %d - should start at %d, head %d", i, len(pieces), sn, p.Impl().DealID, all.Expiration, ts.Height())}
+					}
+
+					if all.Size < p.Piece().Size {
+						return &ErrInvalidDeals{xerrors.Errorf("piece allocation %d (of %d) of sector %d refers deal %d with different size: %d != %d", i, len(pieces), sn, p.Impl().DealID, p.Piece().Size, all.Size)}
+					}
+				}
+
+				return nil
+			},
+		})
 		if err != nil {
-			return &ErrInvalidDeals{xerrors.Errorf("getting deal %d for piece %d: %w", p.DealInfo.DealID, i, err)}
-		}
-
-		if deal.Proposal.Provider != maddr {
-			return &ErrInvalidDeals{xerrors.Errorf("piece %d (of %d) of sector %d refers deal %d with wrong provider: %s != %s", i, len(si.Pieces), si.SectorNumber, p.DealInfo.DealID, deal.Proposal.Provider, maddr)}
-		}
-
-		if deal.Proposal.PieceCID != p.Piece.PieceCID {
-			return &ErrInvalidDeals{xerrors.Errorf("piece %d (of %d) of sector %d refers deal %d with wrong PieceCID: %s != %s", i, len(si.Pieces), si.SectorNumber, p.DealInfo.DealID, p.Piece.PieceCID, deal.Proposal.PieceCID)}
-		}
-
-		if p.Piece.Size != deal.Proposal.PieceSize {
-			return &ErrInvalidDeals{xerrors.Errorf("piece %d (of %d) of sector %d refers deal %d with different size: %d != %d", i, len(si.Pieces), si.SectorNumber, p.DealInfo.DealID, p.Piece.Size, deal.Proposal.PieceSize)}
-		}
-
-		if ts.Height() >= deal.Proposal.StartEpoch {
-			return &ErrExpiredDeals{xerrors.Errorf("piece %d (of %d) of sector %d refers expired deal %d - should start at %d, head %d", i, len(si.Pieces), si.SectorNumber, p.DealInfo.DealID, deal.Proposal.StartEpoch, ts.Height())}
+			return err
 		}
 	}
 
 	if mustHaveDeals && dealCount <= 0 {
-		return &ErrNoDeals{(xerrors.Errorf("sector %d must have deals, but does not", si.SectorNumber))}
+		return &ErrNoDeals{xerrors.Errorf("sector %d must have deals, but does not", sn)}
 	}
 
 	return nil
 }
 
 // checkPrecommit checks that data commitment generated in the sealing process
-//  matches pieces, and that the seal ticket isn't expired
+//
+//	matches pieces, and that the seal ticket isn't expired
 func checkPrecommit(ctx context.Context, maddr address.Address, si SectorInfo, tsk types.TipSetKey, height abi.ChainEpoch, api SealingAPI) (err error) {
-	if err := checkPieces(ctx, maddr, si, api, false); err != nil {
+	if err := checkPieces(ctx, maddr, si.SectorNumber, si.Pieces, api, false); err != nil {
 		return err
 	}
 
-	commD, err := api.StateComputeDataCID(ctx, maddr, si.SectorType, si.dealIDs(), tsk)
-	if err != nil {
-		return &ErrApi{xerrors.Errorf("calling StateComputeDataCommitment: %w", err)}
-	}
+	if si.hasData() {
+		commD, err := computeUnsealedCIDFromPieces(si)
+		if err != nil {
+			return &ErrApi{xerrors.Errorf("calling StateComputeDataCommitment: %w", err)}
+		}
 
-	if si.CommD == nil || !commD.Equals(*si.CommD) {
-		return &ErrBadCommD{xerrors.Errorf("on chain CommD differs from sector: %s != %s", commD, si.CommD)}
+		if si.CommD == nil || !commD.Equals(*si.CommD) {
+			return &ErrBadCommD{xerrors.Errorf("on chain CommD differs from sector: %s != %s", commD, si.CommD)}
+		}
 	}
 
 	pci, err := api.StateSectorPreCommitInfo(ctx, maddr, si.SectorNumber, tsk)
@@ -203,7 +258,7 @@ func (m *Sealing) checkCommit(ctx context.Context, si SectorInfo, proof []byte, 
 		return &ErrInvalidProof{xerrors.New("invalid proof (compute error?)")}
 	}
 
-	if err := checkPieces(ctx, m.maddr, si, m.Api, false); err != nil {
+	if err := checkPieces(ctx, m.maddr, si.SectorNumber, si.Pieces, m.Api, false); err != nil {
 		return err
 	}
 
@@ -211,18 +266,17 @@ func (m *Sealing) checkCommit(ctx context.Context, si SectorInfo, proof []byte, 
 }
 
 // check that sector info is good after running a replica update
-func checkReplicaUpdate(ctx context.Context, maddr address.Address, si SectorInfo, tsk types.TipSetKey, api SealingAPI) error {
-
-	if err := checkPieces(ctx, maddr, si, api, true); err != nil {
+func checkReplicaUpdate(ctx context.Context, maddr address.Address, si SectorInfo, api SealingAPI) error {
+	if err := checkPieces(ctx, maddr, si.SectorNumber, si.Pieces, api, true); err != nil {
 		return err
 	}
 	if !si.CCUpdate {
 		return xerrors.Errorf("replica update on sector not marked for update")
 	}
 
-	commD, err := api.StateComputeDataCID(ctx, maddr, si.SectorType, si.dealIDs(), tsk)
+	commD, err := computeUnsealedCIDFromPieces(si)
 	if err != nil {
-		return &ErrApi{xerrors.Errorf("calling StateComputeDataCommitment: %w", err)}
+		return xerrors.Errorf("computing unsealed CID from pieces: %w", err)
 	}
 
 	if si.UpdateUnsealed == nil {
@@ -241,5 +295,9 @@ func checkReplicaUpdate(ctx context.Context, maddr address.Address, si SectorInf
 	}
 
 	return nil
+}
 
+func computeUnsealedCIDFromPieces(si SectorInfo) (cid.Cid, error) {
+	pcs := si.pieceInfos()
+	return proofs.GenerateUnsealedCID(si.SectorType, pcs)
 }

@@ -7,7 +7,7 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 	"golang.org/x/xerrors"
 
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/chain/actors/policy"
 	"github.com/filecoin-project/lotus/chain/store"
 	"github.com/filecoin-project/lotus/chain/types"
 )
@@ -21,12 +21,13 @@ const (
 )
 
 // FIXME: Bumped from original 800 to this to accommodate `syncFork()`
-//  use of `GetBlocks()`. It seems the expectation of that API is to
-//  fetch any amount of blocks leaving it to the internal logic here
-//  to partition and reassemble the requests if they go above the maximum.
-//  (Also as a consequence of this temporarily removing the `const`
-//   qualifier to avoid "const initializer [...] is not a constant" error.)
-var MaxRequestLength = uint64(build.ForkLengthThreshold)
+//
+//	use of `GetBlocks()`. It seems the expectation of that API is to
+//	fetch any amount of blocks leaving it to the internal logic here
+//	to partition and reassemble the requests if they go above the maximum.
+//	(Also as a consequence of this temporarily removing the `const`
+//	 qualifier to avoid "const initializer [...] is not a constant" error.)
+var MaxRequestLength = uint64(policy.ChainFinality)
 
 const (
 	// Extracted constants from the code.
@@ -37,10 +38,11 @@ const (
 	ReadResMinSpeed     = 50 << 10
 	ShufflePeersPrefix  = 16
 	WriteResDeadline    = 60 * time.Second
+	streamReadDeadline  = 10 * time.Second
+	streamOpenTimeout   = 1 * time.Minute
 )
 
-// FIXME: Rename. Make private.
-type Request struct {
+type Request struct { // FIXME: Rename. Make private.
 	// List of ordered CIDs comprising a `TipSetKey` from where to start
 	// fetching backwards.
 	// FIXME: Consider using `TipSetKey` now (introduced after the creation
@@ -87,8 +89,7 @@ func parseOptions(optfield uint64) *parsedOptions {
 	}
 }
 
-// FIXME: Rename. Make private.
-type Response struct {
+type Response struct { // FIXME: Rename. Make private.
 	Status status
 	// String that complements the error status when converting to an
 	// internal error (see `statusToError()`).
@@ -132,26 +133,28 @@ func (res *Response) statusToError() error {
 	}
 }
 
-// FIXME: Rename.
-type BSTipSet struct {
+type BSTipSet struct { // FIXME: Rename.
 	// List of blocks belonging to a single tipset to which the
 	// `CompactedMessages` are linked.
 	Blocks   []*types.BlockHeader
 	Messages *CompactedMessages
 }
 
-// All messages of a single tipset compacted together instead
+// CompactedMessages has all messages of a single tipset compacted together instead
 // of grouped by block to save space, since there are normally
 // many repeated messages per tipset in different blocks.
 //
 // `BlsIncludes`/`SecpkIncludes` matches `Bls`/`Secpk` messages
 // to blocks in the tipsets with the format:
 // `BlsIncludes[BI][MI]`
-//  * BI: block index in the tipset.
-//  * MI: message index in `Bls` list
+//   - BI: block index in the tipset.
+//   - MI: message index in `Bls` list
 //
 // FIXME: The logic to decompress this structure should belong
-//  to itself, not to the consumer.
+//
+//	to itself, not to the consumer.
+//
+// NOTE: Max messages is: BlockMessageLimit (10k) * MaxTipsetSize (15) = 150k
 type CompactedMessages struct {
 	Bls         []*types.Message
 	BlsIncludes [][]uint64

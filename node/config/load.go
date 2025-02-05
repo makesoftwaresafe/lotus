@@ -4,38 +4,95 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode"
 
 	"github.com/BurntSushi/toml"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/kelseyhightower/envconfig"
 	"golang.org/x/xerrors"
 )
 
 // FromFile loads config from a specified file overriding defaults specified in
 // the def parameter. If file does not exist or is empty defaults are assumed.
-func FromFile(path string, def interface{}) (interface{}, error) {
+func FromFile(path string, opts ...LoadCfgOpt) (interface{}, error) {
+	loadOpts, err := applyOpts(opts...)
+	if err != nil {
+		return nil, err
+	}
+	var def interface{}
+	if loadOpts.defaultCfg != nil {
+		def, err = loadOpts.defaultCfg()
+		if err != nil {
+			return nil, xerrors.Errorf("no config found")
+		}
+	}
+	// check for loadability
 	file, err := os.Open(path)
 	switch {
 	case os.IsNotExist(err):
+		if loadOpts.canFallbackOnDefault != nil {
+			if err := loadOpts.canFallbackOnDefault(); err != nil {
+				return nil, err
+			}
+		}
 		return def, nil
 	case err != nil:
 		return nil, err
 	}
-
-	defer file.Close() //nolint:errcheck // The file is RO
-	return FromReader(file, def)
+	defer file.Close() //nolint:errcheck,staticcheck // The file is RO
+	cfgBs, err := io.ReadAll(file)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to read config for validation checks %w", err)
+	}
+	buf := bytes.NewBuffer(cfgBs)
+	if loadOpts.validate != nil {
+		if err := loadOpts.validate(buf.String()); err != nil {
+			return nil, xerrors.Errorf("config failed validation: %w", err)
+		}
+	}
+	return FromReader(buf, def, opts...)
 }
 
 // FromReader loads config from a reader instance.
-func FromReader(reader io.Reader, def interface{}) (interface{}, error) {
-	cfg := def
-	_, err := toml.DecodeReader(reader, cfg)
+func FromReader(reader io.Reader, def interface{}, opts ...LoadCfgOpt) (interface{}, error) {
+	loadOpts, err := applyOpts(opts...)
 	if err != nil {
 		return nil, err
+	}
+	cfg := def
+	md, err := toml.NewDecoder(reader).Decode(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// find any fields with a tag: `moved:"New.Config.Location"` and move any set values there over to
+	// the new location if they are not already set there.
+	movedFields := findMovedFields(nil, cfg)
+	var warningOut io.Writer = os.Stderr
+	if loadOpts.warningWriter != nil {
+		warningOut = loadOpts.warningWriter
+	}
+	for _, d := range movedFields {
+		if md.IsDefined(d.Field...) {
+			_, _ = fmt.Fprintf(
+				warningOut,
+				"WARNING: Use of deprecated configuration option '%s' will be removed in a future release, use '%s' instead\n",
+				strings.Join(d.Field, "."),
+				strings.Join(d.NewField, "."))
+			if !md.IsDefined(d.NewField...) {
+				// new value isn't set but old is, we should move what the user set there
+				if err := moveFieldValue(cfg, d.Field, d.NewField); err != nil {
+					return nil, fmt.Errorf("failed to move field value: %w", err)
+				}
+			}
+		}
 	}
 
 	err = envconfig.Process("LOTUS", cfg)
@@ -46,7 +103,194 @@ func FromReader(reader io.Reader, def interface{}) (interface{}, error) {
 	return cfg, nil
 }
 
-func ConfigUpdate(cfgCur, cfgDef interface{}, comment bool) ([]byte, error) {
+// move a value from the location in the valPtr struct specified by oldPath, to the location
+// specified by newPath; where the path is an array of nested field names.
+func moveFieldValue(valPtr interface{}, oldPath []string, newPath []string) error {
+	oldValue, err := getFieldValue(valPtr, oldPath)
+	if err != nil {
+		return err
+	}
+	val := reflect.ValueOf(valPtr).Elem()
+	for {
+		field := val.FieldByName(newPath[0])
+		if !field.IsValid() {
+			return fmt.Errorf("unexpected error fetching field value")
+		}
+		if len(newPath) == 1 {
+			if field.Kind() != oldValue.Kind() {
+				return fmt.Errorf("unexpected error, old kind != new kind")
+			}
+			// set field on val to be the new one, and we're done
+			field.Set(oldValue)
+			return nil
+		}
+		if field.Kind() != reflect.Struct {
+			return fmt.Errorf("unexpected error fetching field value, is not a struct")
+		}
+		newPath = newPath[1:]
+		val = field
+	}
+}
+
+// recursively iterate into `path` to find the terminal value
+func getFieldValue(val interface{}, path []string) (reflect.Value, error) {
+	if reflect.ValueOf(val).Kind() == reflect.Ptr {
+		val = reflect.ValueOf(val).Elem().Interface()
+	}
+	field := reflect.ValueOf(val).FieldByName(path[0])
+	if !field.IsValid() {
+		return reflect.Value{}, fmt.Errorf("unexpected error fetching field value")
+	}
+	if len(path) > 1 {
+		if field.Kind() != reflect.Struct {
+			return reflect.Value{}, fmt.Errorf("unexpected error fetching field value, is not a struct")
+		}
+		return getFieldValue(field.Interface(), path[1:])
+	}
+	return field, nil
+}
+
+type movedField struct {
+	Field    []string
+	NewField []string
+}
+
+// inspect the fields recursively within a struct and find any with "moved" tags
+func findMovedFields(path []string, val interface{}) []movedField {
+	dep := make([]movedField, 0)
+	if reflect.ValueOf(val).Kind() == reflect.Ptr {
+		val = reflect.ValueOf(val).Elem().Interface()
+	}
+	t := reflect.TypeOf(val)
+	if t.Kind() != reflect.Struct {
+		return nil
+	}
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		// could also do a "deprecated" in here
+		if idx := field.Tag.Get("moved"); idx != "" && idx != "-" {
+			dep = append(dep, movedField{
+				Field:    append(path, field.Name),
+				NewField: strings.Split(idx, "."),
+			})
+		}
+		if field.Type.Kind() == reflect.Struct && reflect.ValueOf(val).FieldByName(field.Name).IsValid() {
+			deps := findMovedFields(append(path, field.Name), reflect.ValueOf(val).FieldByName(field.Name).Interface())
+			dep = append(dep, deps...)
+		}
+	}
+	return dep
+}
+
+type cfgLoadOpts struct {
+	defaultCfg           func() (interface{}, error)
+	canFallbackOnDefault func() error
+	validate             func(string) error
+	warningWriter        io.Writer
+}
+
+type LoadCfgOpt func(opts *cfgLoadOpts) error
+
+func applyOpts(opts ...LoadCfgOpt) (cfgLoadOpts, error) {
+	var loadOpts cfgLoadOpts
+	var err error
+	for _, opt := range opts {
+		if err = opt(&loadOpts); err != nil {
+			return loadOpts, fmt.Errorf("failed to apply load cfg option: %w", err)
+		}
+	}
+	return loadOpts, nil
+}
+
+func SetDefault(f func() (interface{}, error)) LoadCfgOpt {
+	return func(opts *cfgLoadOpts) error {
+		opts.defaultCfg = f
+		return nil
+	}
+}
+
+func SetCanFallbackOnDefault(f func() error) LoadCfgOpt {
+	return func(opts *cfgLoadOpts) error {
+		opts.canFallbackOnDefault = f
+		return nil
+	}
+}
+
+func SetValidate(f func(string) error) LoadCfgOpt {
+	return func(opts *cfgLoadOpts) error {
+		opts.validate = f
+		return nil
+	}
+}
+
+func SetWarningWriter(w io.Writer) LoadCfgOpt {
+	return func(opts *cfgLoadOpts) error {
+		opts.warningWriter = w
+		return nil
+	}
+}
+
+func NoDefaultForSplitstoreTransition() error {
+	return xerrors.Errorf("FullNode config not found and fallback to default disallowed while we transition to splitstore discard default.  Use `lotus config default` to set this repo up with a default config.  Be sure to set `EnableSplitstore` to `false` if you are running a full archive node")
+}
+
+// MatchEnableSplitstoreField matches the EnableSplitstore field
+func MatchEnableSplitstoreField(s string) bool {
+	enableSplitstoreRx := regexp.MustCompile(`(?m)^\s*EnableSplitstore\s*=`)
+	return enableSplitstoreRx.MatchString(s)
+}
+
+func ValidateSplitstoreSet(cfgRaw string) error {
+	if !MatchEnableSplitstoreField(cfgRaw) {
+		return xerrors.Errorf("Config does not contain explicit set of EnableSplitstore field, refusing to load. Please explicitly set EnableSplitstore. Set it to false if you are running a full archival node")
+	}
+	return nil
+}
+
+type cfgUpdateOpts struct {
+	comment         bool
+	keepUncommented func(string) bool
+	noEnv           bool
+}
+
+// UpdateCfgOpt is a functional option for updating the config
+type UpdateCfgOpt func(opts *cfgUpdateOpts) error
+
+// KeepUncommented sets a function for matching default valeus that should remain uncommented during
+// a config update that comments out default values.
+func KeepUncommented(f func(string) bool) UpdateCfgOpt {
+	return func(opts *cfgUpdateOpts) error {
+		opts.keepUncommented = f
+		return nil
+	}
+}
+
+func Commented(commented bool) UpdateCfgOpt {
+	return func(opts *cfgUpdateOpts) error {
+		opts.comment = commented
+		return nil
+	}
+}
+
+func DefaultKeepUncommented() UpdateCfgOpt {
+	return KeepUncommented(MatchEnableSplitstoreField)
+}
+
+func NoEnv() UpdateCfgOpt {
+	return func(opts *cfgUpdateOpts) error {
+		opts.noEnv = true
+		return nil
+	}
+}
+
+// ConfigUpdate takes in a config and a default config and optionally comments out default values
+func ConfigUpdate(cfgCur, cfgDef interface{}, opts ...UpdateCfgOpt) ([]byte, error) {
+	var updateOpts cfgUpdateOpts
+	for _, opt := range opts {
+		if err := opt(&updateOpts); err != nil {
+			return nil, xerrors.Errorf("failed to apply update cfg option to ConfigUpdate's config: %w", err)
+		}
+	}
 	var nodeStr, defStr string
 	if cfgDef != nil {
 		buf := new(bytes.Buffer)
@@ -68,7 +312,7 @@ func ConfigUpdate(cfgCur, cfgDef interface{}, comment bool) ([]byte, error) {
 		nodeStr = buf.String()
 	}
 
-	if comment {
+	if updateOpts.comment {
 		// create a map of default lines, so we can comment those out later
 		defLines := strings.Split(defStr, "\n")
 		defaults := map[string]struct{}{}
@@ -126,12 +370,16 @@ func ConfigUpdate(cfgCur, cfgDef interface{}, comment bool) ([]byte, error) {
 						outLines = append(outLines, pad+"# type: "+doc.Type)
 					}
 
-					outLines = append(outLines, pad+"# env var: LOTUS_"+strings.ToUpper(strings.ReplaceAll(section, ".", "_"))+"_"+strings.ToUpper(lf[0]))
+					if !updateOpts.noEnv {
+						outLines = append(outLines, pad+"# env var: LOTUS_"+strings.ToUpper(strings.ReplaceAll(section, ".", "_"))+"_"+strings.ToUpper(lf[0]))
+					}
 				}
 			}
 
-			// if there is the same line in the default config, comment it out it output
-			if _, found := defaults[strings.TrimSpace(nodeLines[i])]; (cfgDef == nil || found) && len(line) > 0 {
+			// filter lines from options
+			optsFilter := updateOpts.keepUncommented != nil && updateOpts.keepUncommented(line)
+			// if there is the same line in the default config, comment it out in output
+			if _, found := defaults[strings.TrimSpace(nodeLines[i])]; (cfgDef == nil || found) && len(line) > 0 && !optsFilter {
 				line = pad + "#" + line[len(pad):]
 			}
 			outLines = append(outLines, line)
@@ -144,13 +392,28 @@ func ConfigUpdate(cfgCur, cfgDef interface{}, comment bool) ([]byte, error) {
 	}
 
 	// sanity-check that the updated config parses the same way as the current one
+
 	if cfgDef != nil {
 		cfgUpdated, err := FromReader(strings.NewReader(nodeStr), cfgDef)
 		if err != nil {
 			return nil, xerrors.Errorf("parsing updated config: %w", err)
 		}
 
-		if !reflect.DeepEqual(cfgCur, cfgUpdated) {
+		opts := []cmp.Option{
+			// This equality function compares big.Int
+			cmpopts.IgnoreUnexported(big.Int{}),
+			cmp.Comparer(func(x, y []string) bool {
+				tx, ty := reflect.TypeOf(x), reflect.TypeOf(y)
+				if tx.Kind() == reflect.Slice && ty.Kind() == reflect.Slice && tx.Elem().Kind() == reflect.String && ty.Elem().Kind() == reflect.String {
+					sort.Strings(x)
+					sort.Strings(y)
+					return strings.Join(x, "\n") == strings.Join(y, "\n")
+				}
+				return false
+			}),
+		}
+
+		if !cmp.Equal(cfgUpdated, cfgCur, opts...) {
 			return nil, xerrors.Errorf("updated config didn't match current config")
 		}
 	}
@@ -159,5 +422,5 @@ func ConfigUpdate(cfgCur, cfgDef interface{}, comment bool) ([]byte, error) {
 }
 
 func ConfigComment(t interface{}) ([]byte, error) {
-	return ConfigUpdate(t, nil, true)
+	return ConfigUpdate(t, nil, Commented(true), DefaultKeepUncommented())
 }

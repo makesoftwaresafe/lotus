@@ -6,28 +6,26 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
 	"github.com/google/uuid"
 	logging "github.com/ipfs/go-log/v2"
-	ic "github.com/libp2p/go-libp2p-core/crypto"
-	"github.com/libp2p/go-libp2p-core/peer"
-	"github.com/minio/blake2b-simd"
+	ic "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"golang.org/x/crypto/blake2b"
 	"golang.org/x/xerrors"
 
 	ffi "github.com/filecoin-project/filecoin-ffi"
 	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/go-commp-utils/zerocomm"
+	"github.com/filecoin-project/go-commp-utils/v2/zerocomm"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
-	market8 "github.com/filecoin-project/go-state-types/builtin/v8/market"
+	markettypes "github.com/filecoin-project/go-state-types/builtin/v9/market"
 
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/wallet/key"
 	"github.com/filecoin-project/lotus/genesis"
-	"github.com/filecoin-project/lotus/storage/paths"
 	"github.com/filecoin-project/lotus/storage/sealer/ffiwrapper"
 	"github.com/filecoin-project/lotus/storage/sealer/ffiwrapper/basicfs"
 	"github.com/filecoin-project/lotus/storage/sealer/storiface"
@@ -126,7 +124,7 @@ func PreSeal(maddr address.Address, spt abi.RegisteredSealProof, offset abi.Sect
 	}
 
 	{
-		b, err := json.MarshalIndent(&paths.LocalStorageMeta{
+		b, err := json.MarshalIndent(&storiface.LocalStorageMeta{
 			ID:       storiface.ID(uuid.New().String()),
 			Weight:   0, // read-only
 			CanSeal:  false,
@@ -136,7 +134,7 @@ func PreSeal(maddr address.Address, spt abi.RegisteredSealProof, offset abi.Sect
 			return nil, nil, xerrors.Errorf("marshaling storage config: %w", err)
 		}
 
-		if err := ioutil.WriteFile(filepath.Join(sbroot, "sectorstore.json"), b, 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(sbroot, "sectorstore.json"), b, 0644); err != nil {
 			return nil, nil, xerrors.Errorf("persisting storage metadata (%s): %w", filepath.Join(sbroot, "storage.json"), err)
 		}
 	}
@@ -165,7 +163,7 @@ func presealSector(sb *ffiwrapper.Sealer, sbfs *basicfs.Provider, sid storiface.
 		return nil, xerrors.Errorf("commit: %w", err)
 	}
 
-	if err := sb.FinalizeSector(context.TODO(), sid, nil); err != nil {
+	if err := sb.FinalizeSector(context.TODO(), sid); err != nil {
 		return nil, xerrors.Errorf("trim cache: %w", err)
 	}
 
@@ -229,7 +227,7 @@ func WriteGenesisMiner(maddr address.Address, sbroot string, gm *genesis.Miner, 
 
 	log.Infof("Writing preseal manifest to %s", filepath.Join(sbroot, "pre-seal-"+maddr.String()+".json"))
 
-	if err := ioutil.WriteFile(filepath.Join(sbroot, "pre-seal-"+maddr.String()+".json"), out, 0664); err != nil {
+	if err := os.WriteFile(filepath.Join(sbroot, "pre-seal-"+maddr.String()+".json"), out, 0664); err != nil {
 		return err
 	}
 
@@ -240,7 +238,7 @@ func WriteGenesisMiner(maddr address.Address, sbroot string, gm *genesis.Miner, 
 		}
 
 		// TODO: allow providing key
-		if err := ioutil.WriteFile(filepath.Join(sbroot, "pre-seal-"+maddr.String()+".key"), []byte(hex.EncodeToString(b)), 0664); err != nil {
+		if err := os.WriteFile(filepath.Join(sbroot, "pre-seal-"+maddr.String()+".key"), []byte(hex.EncodeToString(b)), 0664); err != nil {
 			return err
 		}
 	}
@@ -250,12 +248,12 @@ func WriteGenesisMiner(maddr address.Address, sbroot string, gm *genesis.Miner, 
 
 func createDeals(m *genesis.Miner, k *key.Key, maddr address.Address, ssize abi.SectorSize) error {
 	for i, sector := range m.Sectors {
-		label, err := market8.NewLabelFromString(fmt.Sprintf("%d", i))
+		label, err := markettypes.NewLabelFromString(fmt.Sprintf("%d", i))
 		if err != nil {
 			return xerrors.Errorf("error creating deal label: %w", err)
 		}
 
-		proposal := &market8.DealProposal{
+		proposal := &markettypes.DealProposal{
 			PieceCID:             sector.CommD,
 			PieceSize:            abi.PaddedPieceSize(ssize),
 			Client:               k.Address,
@@ -268,7 +266,7 @@ func createDeals(m *genesis.Miner, k *key.Key, maddr address.Address, ssize abi.
 			ClientCollateral:     big.Zero(),
 		}
 
-		sector.DealClientKey = k
+		sector.DealClientKey = k.KeyInfo
 		sector.Deal = *proposal
 	}
 

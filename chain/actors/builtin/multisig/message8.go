@@ -5,12 +5,13 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
-	builtin8 "github.com/filecoin-project/go-state-types/builtin"
-	init8 "github.com/filecoin-project/go-state-types/builtin/v8/init"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+	builtintypes "github.com/filecoin-project/go-state-types/builtin"
+	init16 "github.com/filecoin-project/go-state-types/builtin/v16/init"
 	multisig8 "github.com/filecoin-project/go-state-types/builtin/v8/multisig"
+	"github.com/filecoin-project/go-state-types/manifest"
 
 	"github.com/filecoin-project/lotus/chain/actors"
-	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	init_ "github.com/filecoin-project/lotus/chain/actors/builtin/init"
 	"github.com/filecoin-project/lotus/chain/types"
 )
@@ -50,13 +51,13 @@ func (m message8) Create(
 		return nil, actErr
 	}
 
-	code, err := builtin.GetMultisigActorCodeID(actors.Version8)
-	if err != nil {
+	code, ok := actors.GetActorCodeID(actorstypes.Version8, manifest.MultisigKey)
+	if !ok {
 		return nil, xerrors.Errorf("failed to get multisig code ID")
 	}
 
 	// new actors are created by invoking 'exec' on the init actor with the constructor params
-	execParams := &init8.ExecParams{
+	execParams := &init16.ExecParams{
 		CodeCID:           code,
 		ConstructorParams: enc,
 	}
@@ -69,7 +70,7 @@ func (m message8) Create(
 	return &types.Message{
 		To:     init_.Address,
 		From:   m.from,
-		Method: builtin8.MethodsInit.Exec,
+		Method: builtintypes.MethodsInit.Exec,
 		Params: enc,
 		Value:  initialAmount,
 	}, nil

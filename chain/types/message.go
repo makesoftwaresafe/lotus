@@ -14,7 +14,7 @@ import (
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/network"
 
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 )
 
 const MessageVersion = 0
@@ -155,12 +155,20 @@ func (m *Message) ValidForBlockInclusion(minGas int64, version network.Version) 
 		return xerrors.New("'To' address cannot be empty")
 	}
 
-	if m.To == build.ZeroAddress && version >= network.Version7 {
+	if m.To == buildconstants.ZeroAddress && version >= network.Version7 {
 		return xerrors.New("invalid 'To' address")
+	}
+
+	if !abi.AddressValidForNetworkVersion(m.To, version) {
+		return xerrors.New("'To' address protocol unsupported for network version")
 	}
 
 	if m.From == address.Undef {
 		return xerrors.New("'From' address cannot be empty")
+	}
+
+	if !abi.AddressValidForNetworkVersion(m.From, version) {
+		return xerrors.New("'From' address protocol unsupported for network version")
 	}
 
 	if m.Value.Int == nil {
@@ -195,8 +203,12 @@ func (m *Message) ValidForBlockInclusion(minGas int64, version network.Version) 
 		return xerrors.New("'GasFeeCap' less than 'GasPremium'")
 	}
 
-	if m.GasLimit > build.BlockGasLimit {
-		return xerrors.New("'GasLimit' field cannot be greater than a block's gas limit")
+	if m.GasLimit > buildconstants.BlockGasLimit {
+		return xerrors.Errorf("'GasLimit' field cannot be greater than a block's gas limit (%d > %d)", m.GasLimit, buildconstants.BlockGasLimit)
+	}
+
+	if m.GasLimit <= 0 {
+		return xerrors.Errorf("'GasLimit' field %d must be positive", m.GasLimit)
 	}
 
 	// since prices might vary with time, this is technically semantic validation
@@ -205,6 +217,24 @@ func (m *Message) ValidForBlockInclusion(minGas int64, version network.Version) 
 	}
 
 	return nil
+}
+
+// EffectiveGasPremium returns the effective gas premium claimable by the miner
+// given the supplied base fee. This method is not used anywhere except the Eth API.
+//
+// Filecoin clamps the gas premium at GasFeeCap - BaseFee, if lower than the
+// specified premium. Returns 0 if GasFeeCap is less than BaseFee.
+func (m *Message) EffectiveGasPremium(baseFee abi.TokenAmount) abi.TokenAmount {
+	available := big.Sub(m.GasFeeCap, baseFee)
+	// It's possible that storage providers may include messages with gasFeeCap less than the baseFee
+	// In such cases, their reward should be viewed as zero
+	if available.LessThan(big.NewInt(0)) {
+		available = big.NewInt(0)
+	}
+	if big.Cmp(m.GasPremium, available) <= 0 {
+		return m.GasPremium
+	}
+	return available
 }
 
 const TestGasLimit = 100e6

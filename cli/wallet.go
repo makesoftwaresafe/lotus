@@ -6,11 +6,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/urfave/cli/v2"
+	"golang.org/x/term"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
@@ -19,12 +21,13 @@ import (
 	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/filecoin-project/go-state-types/network"
 
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
+	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/lib/tablewriter"
 )
 
-var walletCmd = &cli.Command{
+var WalletCmd = &cli.Command{
 	Name:  "wallet",
 	Usage: "Manage wallet",
 	Subcommands: []*cli.Command{
@@ -45,7 +48,7 @@ var walletCmd = &cli.Command{
 var walletNew = &cli.Command{
 	Name:      "new",
 	Usage:     "Generate a new key of the given type",
-	ArgsUsage: "[bls|secp256k1 (default secp256k1)]",
+	ArgsUsage: "[bls|secp256k1|delegated (default secp256k1)]",
 	Action: func(cctx *cli.Context) error {
 		api, closer, err := GetFullNodeAPI(cctx)
 		if err != nil {
@@ -206,7 +209,12 @@ var walletBalance = &cli.Command{
 			return err
 		}
 
-		if balance.Equals(types.NewInt(0)) {
+		inSync, err := IsSyncDone(ctx, api)
+		if err != nil {
+			return err
+		}
+
+		if balance.Equals(types.NewInt(0)) && !inSync {
 			afmt.Printf("%s (warning: may display 0 if chain sync in progress)\n", types.FIL(balance))
 		} else {
 			afmt.Printf("%s\n", types.FIL(balance))
@@ -251,8 +259,8 @@ var walletSetDefault = &cli.Command{
 		defer closer()
 		ctx := ReqContext(cctx)
 
-		if !cctx.Args().Present() {
-			return fmt.Errorf("must pass address to set as default")
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		addr, err := address.NewFromString(cctx.Args().First())
@@ -260,6 +268,7 @@ var walletSetDefault = &cli.Command{
 			return err
 		}
 
+		fmt.Println("Default address set to:", addr)
 		return api.WalletSetDefault(ctx, addr)
 	},
 }
@@ -278,8 +287,8 @@ var walletExport = &cli.Command{
 
 		afmt := NewAppFmt(cctx.App)
 
-		if !cctx.Args().Present() {
-			return fmt.Errorf("must specify key to export")
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		addr, err := address.NewFromString(cctx.Args().First())
@@ -327,16 +336,35 @@ var walletImport = &cli.Command{
 
 		var inpdata []byte
 		if !cctx.Args().Present() || cctx.Args().First() == "-" {
-			reader := bufio.NewReader(os.Stdin)
-			fmt.Print("Enter private key: ")
-			indata, err := reader.ReadBytes('\n')
-			if err != nil {
-				return err
+			if term.IsTerminal(int(os.Stdin.Fd())) {
+				fmt.Print("Enter private key(not display in the terminal): ")
+
+				sigCh := make(chan os.Signal, 1)
+				// Notify the channel when SIGINT is received
+				signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+				go func() {
+					<-sigCh
+					fmt.Println("\nInterrupt signal received. Exiting...")
+					os.Exit(1)
+				}()
+
+				inpdata, err = term.ReadPassword(int(os.Stdin.Fd()))
+				if err != nil {
+					return err
+				}
+				fmt.Println()
+			} else {
+				reader := bufio.NewReader(os.Stdin)
+				indata, err := reader.ReadBytes('\n')
+				if err != nil {
+					return err
+				}
+				inpdata = indata
 			}
-			inpdata = indata
 
 		} else {
-			fdata, err := ioutil.ReadFile(cctx.Args().First())
+			fdata, err := os.ReadFile(cctx.Args().First())
 			if err != nil {
 				return err
 			}
@@ -413,8 +441,8 @@ var walletSign = &cli.Command{
 
 		afmt := NewAppFmt(cctx.App)
 
-		if !cctx.Args().Present() || cctx.NArg() != 2 {
-			return fmt.Errorf("must specify signing address and message to sign")
+		if cctx.NArg() != 2 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		addr, err := address.NewFromString(cctx.Args().First())
@@ -432,7 +460,12 @@ var walletSign = &cli.Command{
 		sig, err := api.WalletSign(ctx, addr, msg)
 
 		if err != nil {
-			return err
+			// Check if the address is a multisig address
+			act, actErr := api.StateGetActor(ctx, addr, types.EmptyTSK)
+			if actErr == nil && builtin.IsMultisigActor(act.Code) {
+				return xerrors.Errorf("specified signer address is a multisig actor, it doesn’t have keys to sign transactions. To send a message with a multisig, signers of the multisig need to propose and approve transactions.")
+			}
+			return xerrors.Errorf("failed to sign message: %w", err)
 		}
 
 		sigBytes := append([]byte{byte(sig.Type)}, sig.Data...)
@@ -456,8 +489,8 @@ var walletVerify = &cli.Command{
 
 		afmt := NewAppFmt(cctx.App)
 
-		if !cctx.Args().Present() || cctx.NArg() != 3 {
-			return fmt.Errorf("must specify signing address, message, and signature to verify")
+		if cctx.NArg() != 3 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		addr, err := address.NewFromString(cctx.Args().First())
@@ -508,8 +541,8 @@ var walletDelete = &cli.Command{
 		defer closer()
 		ctx := ReqContext(cctx)
 
-		if !cctx.Args().Present() || cctx.NArg() != 1 {
-			return fmt.Errorf("must specify address to delete")
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		addr, err := address.NewFromString(cctx.Args().First())
@@ -517,6 +550,8 @@ var walletDelete = &cli.Command{
 			return err
 		}
 
+		fmt.Println("Soft deleting address:", addr)
+		fmt.Println("Hard deletion of the address in `~/.lotus/keystore` is needed for permanent removal")
 		return api.WalletDelete(ctx, addr)
 	},
 }
@@ -548,7 +583,7 @@ var walletMarketWithdraw = &cli.Command{
 		&cli.IntFlag{
 			Name:  "confidence",
 			Usage: "number of block confirmations to wait for",
-			Value: int(build.MessageConfidence),
+			Value: int(buildconstants.MessageConfidence),
 		},
 	},
 	Action: func(cctx *cli.Context) error {
@@ -645,7 +680,7 @@ var walletMarketWithdraw = &cli.Command{
 		}
 
 		// check it executed successfully
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			afmt.Println(cctx.App.Writer, "withdrawal failed!")
 			return err
 		}
@@ -698,8 +733,8 @@ var walletMarketAdd = &cli.Command{
 		afmt := NewAppFmt(cctx.App)
 
 		// Get amount param
-		if !cctx.Args().Present() {
-			return fmt.Errorf("must pass amount to add")
+		if cctx.NArg() < 1 {
+			return IncorrectNumArgs(cctx)
 		}
 		f, err := types.ParseFIL(cctx.Args().First())
 		if err != nil {

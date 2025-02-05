@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	crand "crypto/rand"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -19,6 +20,7 @@ import (
 	"github.com/filecoin-project/lotus/chain/vectors"
 	"github.com/filecoin-project/lotus/chain/wallet"
 	_ "github.com/filecoin-project/lotus/lib/sigs/bls"
+	_ "github.com/filecoin-project/lotus/lib/sigs/delegated"
 	_ "github.com/filecoin-project/lotus/lib/sigs/secp"
 )
 
@@ -144,7 +146,10 @@ func MakeUnsignedMessageVectors() []vectors.UnsignedMessageVector {
 		}
 
 		params := make([]byte, 32)
-		rand.Read(params)
+		_, err = crand.Read(params)
+		if err != nil {
+			panic(err)
+		}
 
 		msg := &types.Message{
 			To:         to,

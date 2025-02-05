@@ -7,6 +7,7 @@ import (
 
 	"github.com/ipfs/go-cid"
 	"go.opencensus.io/trace"
+	"go.uber.org/zap"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
@@ -14,7 +15,6 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/builtin"
-	"github.com/filecoin-project/go-state-types/builtin/v8/miner"
 	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/filecoin-project/go-state-types/dline"
 	"github.com/filecoin-project/go-state-types/network"
@@ -23,7 +23,9 @@ import (
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/actors"
+	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/actors/policy"
 	"github.com/filecoin-project/lotus/chain/messagepool"
 	"github.com/filecoin-project/lotus/chain/types"
@@ -31,6 +33,8 @@ import (
 )
 
 // recordPoStFailure records a failure in the journal.
+//
+//nolint:unused
 func (s *WindowPoStScheduler) recordPoStFailure(err error, ts *types.TipSet, deadline *dline.Info) {
 	s.journal.RecordEvent(s.evtTypes[evtTypeWdPoStScheduler], func() interface{} {
 		c := evtCommon{Error: err}
@@ -113,7 +117,6 @@ func (s *WindowPoStScheduler) startSubmitPoST(
 	posts []miner.SubmitWindowedPoStParams,
 	completeSubmitPoST CompleteSubmitPoSTCb,
 ) context.CancelFunc {
-
 	ctx, abort := context.WithCancel(ctx)
 	go func() {
 		defer abort()
@@ -188,12 +191,12 @@ func (s *WindowPoStScheduler) runSubmitPoST(
 func (s *WindowPoStScheduler) checkSectors(ctx context.Context, check bitfield.BitField, tsk types.TipSetKey) (bitfield.BitField, error) {
 	mid, err := address.IDFromAddress(s.actor)
 	if err != nil {
-		return bitfield.BitField{}, err
+		return bitfield.BitField{}, xerrors.Errorf("failed to convert to ID addr: %w", err)
 	}
 
 	sectorInfos, err := s.api.StateMinerSectors(ctx, s.actor, &check, tsk)
 	if err != nil {
-		return bitfield.BitField{}, err
+		return bitfield.BitField{}, xerrors.Errorf("failed to get sector infos: %w", err)
 	}
 
 	type checkSector struct {
@@ -217,7 +220,21 @@ func (s *WindowPoStScheduler) checkSectors(ctx context.Context, check bitfield.B
 		})
 	}
 
-	bad, err := s.faultTracker.CheckProvable(ctx, s.proofType, tocheck, func(ctx context.Context, id abi.SectorID) (cid.Cid, bool, error) {
+	nv, err := s.api.StateNetworkVersion(ctx, types.EmptyTSK)
+	if err != nil {
+		return bitfield.BitField{}, xerrors.Errorf("failed to get network version: %w", err)
+	}
+
+	pp := s.proofType
+	// TODO: Drop after nv19 comes and goes
+	if nv >= network.Version19 {
+		pp, err = pp.ToV1_1PostProof()
+		if err != nil {
+			return bitfield.BitField{}, xerrors.Errorf("failed to convert to v1_1 post proof: %w", err)
+		}
+	}
+
+	bad, err := s.faultTracker.CheckProvable(ctx, pp, tocheck, func(ctx context.Context, id abi.SectorID) (cid.Cid, bool, error) {
 		s, ok := sectors[id.Number]
 		if !ok {
 			return cid.Undef, false, xerrors.Errorf("sealed CID not found")
@@ -241,275 +258,6 @@ func (s *WindowPoStScheduler) checkSectors(ctx context.Context, check bitfield.B
 	return sbf, nil
 }
 
-// declareRecoveries identifies sectors that were previously marked as faulty
-// for our miner, but are now recovered (i.e. are now provable again) and
-// still not reported as such.
-//
-// It then reports the recovery on chain via a `DeclareFaultsRecovered`
-// message to our miner actor.
-//
-// This is always invoked ahead of time, before the deadline for the evaluated
-// sectors arrives. That way, recoveries are declared in preparation for those
-// sectors to be proven.
-//
-// If a declaration is made, it awaits for build.MessageConfidence confirmations
-// on chain before returning.
-//
-// TODO: the waiting should happen in the background. Right now this
-//  is blocking/delaying the actual generation and submission of WindowPoSts in
-//  this deadline!
-func (s *WindowPoStScheduler) declareRecoveries(ctx context.Context, dlIdx uint64, partitions []api.Partition, tsk types.TipSetKey) ([]miner.RecoveryDeclaration, *types.SignedMessage, error) {
-	ctx, span := trace.StartSpan(ctx, "storage.declareRecoveries")
-	defer span.End()
-
-	faulty := uint64(0)
-	params := &miner.DeclareFaultsRecoveredParams{
-		Recoveries: []miner.RecoveryDeclaration{},
-	}
-
-	for partIdx, partition := range partitions {
-		unrecovered, err := bitfield.SubtractBitField(partition.FaultySectors, partition.RecoveringSectors)
-		if err != nil {
-			return nil, nil, xerrors.Errorf("subtracting recovered set from fault set: %w", err)
-		}
-
-		uc, err := unrecovered.Count()
-		if err != nil {
-			return nil, nil, xerrors.Errorf("counting unrecovered sectors: %w", err)
-		}
-
-		if uc == 0 {
-			continue
-		}
-
-		faulty += uc
-
-		recovered, err := s.checkSectors(ctx, unrecovered, tsk)
-		if err != nil {
-			return nil, nil, xerrors.Errorf("checking unrecovered sectors: %w", err)
-		}
-
-		// if all sectors failed to recover, don't declare recoveries
-		recoveredCount, err := recovered.Count()
-		if err != nil {
-			return nil, nil, xerrors.Errorf("counting recovered sectors: %w", err)
-		}
-
-		if recoveredCount == 0 {
-			continue
-		}
-
-		params.Recoveries = append(params.Recoveries, miner.RecoveryDeclaration{
-			Deadline:  dlIdx,
-			Partition: uint64(partIdx),
-			Sectors:   recovered,
-		})
-	}
-
-	recoveries := params.Recoveries
-	if len(recoveries) == 0 {
-		if faulty != 0 {
-			log.Warnw("No recoveries to declare", "deadline", dlIdx, "faulty", faulty)
-		}
-
-		return recoveries, nil, nil
-	}
-
-	enc, aerr := actors.SerializeParams(params)
-	if aerr != nil {
-		return recoveries, nil, xerrors.Errorf("could not serialize declare recoveries parameters: %w", aerr)
-	}
-
-	msg := &types.Message{
-		To:     s.actor,
-		Method: builtin.MethodsMiner.DeclareFaultsRecovered,
-		Params: enc,
-		Value:  types.NewInt(0),
-	}
-	spec := &api.MessageSendSpec{MaxFee: abi.TokenAmount(s.feeCfg.MaxWindowPoStGasFee)}
-	if err := s.prepareMessage(ctx, msg, spec); err != nil {
-		return recoveries, nil, err
-	}
-
-	sm, err := s.api.MpoolPushMessage(ctx, msg, &api.MessageSendSpec{MaxFee: abi.TokenAmount(s.feeCfg.MaxWindowPoStGasFee)})
-	if err != nil {
-		return recoveries, sm, xerrors.Errorf("pushing message to mpool: %w", err)
-	}
-
-	log.Warnw("declare faults recovered Message CID", "cid", sm.Cid())
-
-	rec, err := s.api.StateWaitMsg(context.TODO(), sm.Cid(), build.MessageConfidence, api.LookbackNoLimit, true)
-	if err != nil {
-		return recoveries, sm, xerrors.Errorf("declare faults recovered wait error: %w", err)
-	}
-
-	if rec.Receipt.ExitCode != 0 {
-		return recoveries, sm, xerrors.Errorf("declare faults recovered wait non-0 exit code: %d", rec.Receipt.ExitCode)
-	}
-
-	return recoveries, sm, nil
-}
-
-// declareFaults identifies the sectors on the specified proving deadline that
-// are faulty, and reports the faults on chain via the `DeclareFaults` message
-// to our miner actor.
-//
-// This is always invoked ahead of time, before the deadline for the evaluated
-// sectors arrives. That way, faults are declared before a penalty is accrued.
-//
-// If a declaration is made, it awaits for build.MessageConfidence confirmations
-// on chain before returning.
-//
-// TODO: the waiting should happen in the background. Right now this
-//  is blocking/delaying the actual generation and submission of WindowPoSts in
-//  this deadline!
-func (s *WindowPoStScheduler) declareFaults(ctx context.Context, dlIdx uint64, partitions []api.Partition, tsk types.TipSetKey) ([]miner.FaultDeclaration, *types.SignedMessage, error) {
-	ctx, span := trace.StartSpan(ctx, "storage.declareFaults")
-	defer span.End()
-
-	bad := uint64(0)
-	params := &miner.DeclareFaultsParams{
-		Faults: []miner.FaultDeclaration{},
-	}
-
-	for partIdx, partition := range partitions {
-		nonFaulty, err := bitfield.SubtractBitField(partition.LiveSectors, partition.FaultySectors)
-		if err != nil {
-			return nil, nil, xerrors.Errorf("determining non faulty sectors: %w", err)
-		}
-
-		good, err := s.checkSectors(ctx, nonFaulty, tsk)
-		if err != nil {
-			return nil, nil, xerrors.Errorf("checking sectors: %w", err)
-		}
-
-		newFaulty, err := bitfield.SubtractBitField(nonFaulty, good)
-		if err != nil {
-			return nil, nil, xerrors.Errorf("calculating faulty sector set: %w", err)
-		}
-
-		c, err := newFaulty.Count()
-		if err != nil {
-			return nil, nil, xerrors.Errorf("counting faulty sectors: %w", err)
-		}
-
-		if c == 0 {
-			continue
-		}
-
-		bad += c
-
-		params.Faults = append(params.Faults, miner.FaultDeclaration{
-			Deadline:  dlIdx,
-			Partition: uint64(partIdx),
-			Sectors:   newFaulty,
-		})
-	}
-
-	faults := params.Faults
-	if len(faults) == 0 {
-		return faults, nil, nil
-	}
-
-	log.Errorw("DETECTED FAULTY SECTORS, declaring faults", "count", bad)
-
-	enc, aerr := actors.SerializeParams(params)
-	if aerr != nil {
-		return faults, nil, xerrors.Errorf("could not serialize declare faults parameters: %w", aerr)
-	}
-
-	msg := &types.Message{
-		To:     s.actor,
-		Method: builtin.MethodsMiner.DeclareFaults,
-		Params: enc,
-		Value:  types.NewInt(0), // TODO: Is there a fee?
-	}
-	spec := &api.MessageSendSpec{MaxFee: abi.TokenAmount(s.feeCfg.MaxWindowPoStGasFee)}
-	if err := s.prepareMessage(ctx, msg, spec); err != nil {
-		return faults, nil, err
-	}
-
-	sm, err := s.api.MpoolPushMessage(ctx, msg, spec)
-	if err != nil {
-		return faults, sm, xerrors.Errorf("pushing message to mpool: %w", err)
-	}
-
-	log.Warnw("declare faults Message CID", "cid", sm.Cid())
-
-	rec, err := s.api.StateWaitMsg(context.TODO(), sm.Cid(), build.MessageConfidence, api.LookbackNoLimit, true)
-	if err != nil {
-		return faults, sm, xerrors.Errorf("declare faults wait error: %w", err)
-	}
-
-	if rec.Receipt.ExitCode != 0 {
-		return faults, sm, xerrors.Errorf("declare faults wait non-0 exit code: %d", rec.Receipt.ExitCode)
-	}
-
-	return faults, sm, nil
-}
-
-func (s *WindowPoStScheduler) asyncFaultRecover(di dline.Info, ts *types.TipSet) {
-	go func() {
-		// check faults / recoveries for the *next* deadline. It's already too
-		// late to declare them for this deadline
-		declDeadline := (di.Index + 2) % di.WPoStPeriodDeadlines
-
-		partitions, err := s.api.StateMinerPartitions(context.TODO(), s.actor, declDeadline, ts.Key())
-		if err != nil {
-			log.Errorf("getting partitions: %v", err)
-			return
-		}
-
-		var (
-			sigmsg     *types.SignedMessage
-			recoveries []miner.RecoveryDeclaration
-			faults     []miner.FaultDeclaration
-
-			// optionalCid returns the CID of the message, or cid.Undef is the
-			// message is nil. We don't need the argument (could capture the
-			// pointer), but it's clearer and purer like that.
-			optionalCid = func(sigmsg *types.SignedMessage) cid.Cid {
-				if sigmsg == nil {
-					return cid.Undef
-				}
-				return sigmsg.Cid()
-			}
-		)
-
-		if recoveries, sigmsg, err = s.declareRecoveries(context.TODO(), declDeadline, partitions, ts.Key()); err != nil {
-			// TODO: This is potentially quite bad, but not even trying to post when this fails is objectively worse
-			log.Errorf("checking sector recoveries: %v", err)
-		}
-
-		s.journal.RecordEvent(s.evtTypes[evtTypeWdPoStRecoveries], func() interface{} {
-			j := WdPoStRecoveriesProcessedEvt{
-				evtCommon:    s.getEvtCommon(err),
-				Declarations: recoveries,
-				MessageCID:   optionalCid(sigmsg),
-			}
-			j.Error = err
-			return j
-		})
-
-		if ts.Height() > build.UpgradeIgnitionHeight {
-			return // FORK: declaring faults after ignition upgrade makes no sense
-		}
-
-		if faults, sigmsg, err = s.declareFaults(context.TODO(), declDeadline, partitions, ts.Key()); err != nil {
-			// TODO: This is also potentially really bad, but we try to post anyways
-			log.Errorf("checking sector faults: %v", err)
-		}
-
-		s.journal.RecordEvent(s.evtTypes[evtTypeWdPoStFaults], func() interface{} {
-			return WdPoStFaultsProcessedEvt{
-				evtCommon:    s.getEvtCommon(err),
-				Declarations: faults,
-				MessageCID:   optionalCid(sigmsg),
-			}
-		})
-	}()
-}
-
 // runPoStCycle runs a full cycle of the PoSt process:
 //
 //  1. performs recovery declarations for the next deadline.
@@ -521,6 +269,14 @@ func (s *WindowPoStScheduler) asyncFaultRecover(di dline.Info, ts *types.TipSet)
 func (s *WindowPoStScheduler) runPoStCycle(ctx context.Context, manual bool, di dline.Info, ts *types.TipSet) ([]miner.SubmitWindowedPoStParams, error) {
 	ctx, span := trace.StartSpan(ctx, "storage.runPoStCycle")
 	defer span.End()
+
+	start := time.Now()
+
+	log := log.WithOptions(zap.Fields(zap.Time("cycle", start)))
+	log.Infow("starting PoSt cycle", "manual", manual, "ts", ts, "deadline", di.Index)
+	defer func() {
+		log.Infow("post cycle done", "took", time.Since(start))
+	}()
 
 	if !manual {
 		// TODO: extract from runPoStCycle, run on fault cutoff boundaries
@@ -555,8 +311,9 @@ func (s *WindowPoStScheduler) runPoStCycle(ctx context.Context, manual bool, di 
 
 	// Split partitions into batches, so as not to exceed the number of sectors
 	// allowed in a single message
-	partitionBatches, err := s.batchPartitions(partitions, nv)
+	partitionBatches, err := s.BatchPartitions(partitions, nv)
 	if err != nil {
+		log.Errorf("batch partitions failed: %+v", err)
 		return nil, err
 	}
 
@@ -604,9 +361,15 @@ func (s *WindowPoStScheduler) runPoStCycle(ctx context.Context, manual bool, di 
 					return nil, xerrors.Errorf("adding recoveries to set of sectors to prove: %w", err)
 				}
 
-				good, err := s.checkSectors(ctx, toProve, ts.Key())
+				good, err := toProve.Copy()
 				if err != nil {
-					return nil, xerrors.Errorf("checking sectors to skip: %w", err)
+					return nil, xerrors.Errorf("copy toProve: %w", err)
+				}
+				if !s.disablePreChecks {
+					good, err = s.checkSectors(ctx, toProve, ts.Key())
+					if err != nil {
+						return nil, xerrors.Errorf("checking sectors to skip: %w", err)
+					}
 				}
 
 				good, err = bitfield.SubtractBitField(good, postSkipped)
@@ -661,7 +424,12 @@ func (s *WindowPoStScheduler) runPoStCycle(ctx context.Context, manual bool, di 
 				return nil, err
 			}
 
-			postOut, ps, err := s.prover.GenerateWindowPoSt(ctx, abi.ActorID(mid), xsinfos, append(abi.PoStRandomness{}, rand...))
+			ppt, err := xsinfos[0].SealProof.RegisteredWindowPoStProofByNetworkVersion(nv)
+			if err != nil {
+				return nil, xerrors.Errorf("failed to get window post type: %w", err)
+			}
+
+			postOut, ps, err := s.prover.GenerateWindowPoSt(ctx, abi.ActorID(mid), ppt, xsinfos, append(abi.PoStRandomness{}, rand...))
 			elapsed := time.Since(tsStart)
 			log.Infow("computing window post", "batch", batchIdx, "elapsed", elapsed, "skip", len(ps), "err", err)
 			if err != nil {
@@ -755,7 +523,12 @@ func (s *WindowPoStScheduler) runPoStCycle(ctx context.Context, manual bool, di 
 	return posts, nil
 }
 
-func (s *WindowPoStScheduler) batchPartitions(partitions []api.Partition, nv network.Version) ([][]api.Partition, error) {
+// BatchPartitions splits partitions into batches of partitions, so as not to exceed the number of
+// sectors allowed in a single message.
+//
+// Note: Partition order within batches must match original partition order in order
+// for code following the user code to work
+func (s *WindowPoStScheduler) BatchPartitions(partitions []api.Partition, nv network.Version) ([][]api.Partition, error) {
 	// We don't want to exceed the number of sectors allowed in a message.
 	// So given the number of sectors in a partition, work out the number of
 	// partitions that can be in a message without exceeding sectors per
@@ -780,21 +553,40 @@ func (s *WindowPoStScheduler) batchPartitions(partitions []api.Partition, nv net
 		partitionsPerMsg = declMax
 	}
 
-	// The number of messages will be:
-	// ceiling(number of partitions / partitions per message)
-	batchCount := len(partitions) / partitionsPerMsg
-	if len(partitions)%partitionsPerMsg != 0 {
-		batchCount++
+	// respect user config if set
+	if s.maxPartitionsPerPostMessage > 0 {
+		if partitionsPerMsg > s.maxPartitionsPerPostMessage {
+			partitionsPerMsg = s.maxPartitionsPerPostMessage
+		}
 	}
 
-	// Split the partitions into batches
-	batches := make([][]api.Partition, 0, batchCount)
-	for i := 0; i < len(partitions); i += partitionsPerMsg {
-		end := i + partitionsPerMsg
-		if end > len(partitions) {
-			end = len(partitions)
+	batches := [][]api.Partition{}
+
+	currBatch := []api.Partition{}
+	for _, partition := range partitions {
+		recSectors, err := partition.RecoveringSectors.Count()
+		if err != nil {
+			return nil, err
 		}
-		batches = append(batches, partitions[i:end])
+
+		// Only add single partition to a batch if it contains recovery sectors
+		// and has the below user config set
+		if s.singleRecoveringPartitionPerPostMessage && recSectors > 0 {
+			if len(currBatch) > 0 {
+				batches = append(batches, currBatch)
+				currBatch = []api.Partition{}
+			}
+			batches = append(batches, []api.Partition{partition})
+		} else {
+			if len(currBatch) >= partitionsPerMsg {
+				batches = append(batches, currBatch)
+				currBatch = []api.Partition{}
+			}
+			currBatch = append(currBatch, partition)
+		}
+	}
+	if len(currBatch) > 0 {
+		batches = append(batches, currBatch)
 	}
 
 	return batches, nil
@@ -862,7 +654,7 @@ func (s *WindowPoStScheduler) submitPoStMessage(ctx context.Context, proof *mine
 		Params: enc,
 		Value:  types.NewInt(0),
 	}
-	spec := &api.MessageSendSpec{MaxFee: abi.TokenAmount(s.feeCfg.MaxWindowPoStGasFee)}
+	spec := &api.MessageSendSpec{MaxFee: abi.TokenAmount(s.feeCfg.MaxWindowPoStGasFee), MaximizeFeeCap: s.feeCfg.MaximizeWindowPoStFeeCap}
 	if err := s.prepareMessage(ctx, msg, spec); err != nil {
 		return nil, err
 	}
@@ -875,7 +667,7 @@ func (s *WindowPoStScheduler) submitPoStMessage(ctx context.Context, proof *mine
 	log.Infof("Submitted window post: %s (deadline %d)", sm.Cid(), proof.Deadline)
 
 	go func() {
-		rec, err := s.api.StateWaitMsg(context.TODO(), sm.Cid(), build.MessageConfidence, api.LookbackNoLimit, true)
+		rec, err := s.api.StateWaitMsg(context.TODO(), sm.Cid(), buildconstants.MessageConfidence, api.LookbackNoLimit, true)
 		if err != nil {
 			log.Error(err)
 			return
@@ -972,4 +764,8 @@ func (s *WindowPoStScheduler) ComputePoSt(ctx context.Context, dlIdx uint64, ts 
 	dl.Challenge += epochDiff
 
 	return s.runPoStCycle(ctx, true, *dl, ts)
+}
+
+func (s *WindowPoStScheduler) ManualFaultRecovery(ctx context.Context, maddr address.Address, sectors []abi.SectorNumber) ([]cid.Cid, error) {
+	return s.declareManualRecoveries(ctx, maddr, sectors, types.TipSetKey{})
 }

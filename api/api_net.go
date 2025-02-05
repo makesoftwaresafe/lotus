@@ -4,10 +4,10 @@ import (
 	"context"
 	"time"
 
-	"github.com/libp2p/go-libp2p-core/metrics"
-	"github.com/libp2p/go-libp2p-core/network"
-	"github.com/libp2p/go-libp2p-core/peer"
-	"github.com/libp2p/go-libp2p-core/protocol"
+	"github.com/libp2p/go-libp2p/core/metrics"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 )
 
 //                       MODIFYING THE API INTERFACE
@@ -66,12 +66,7 @@ type Net interface {
 	ID(context.Context) (peer.ID, error) //perm:read
 }
 
-type CommonNet interface {
-	Common
-	Net
-}
-
 type NatInfo struct {
 	Reachability network.Reachability
-	PublicAddr   string
+	PublicAddrs  []string
 }

@@ -1,13 +1,18 @@
 package reward
 
 import (
+	"fmt"
+
 	"github.com/ipfs/go-cid"
 
 	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
 	miner8 "github.com/filecoin-project/go-state-types/builtin/v8/miner"
 	reward8 "github.com/filecoin-project/go-state-types/builtin/v8/reward"
 	smoothing8 "github.com/filecoin-project/go-state-types/builtin/v8/util/smoothing"
+	"github.com/filecoin-project/go-state-types/manifest"
 
+	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
 	"github.com/filecoin-project/lotus/chain/actors/builtin"
 )
@@ -71,7 +76,7 @@ func (s *state8) CumsumRealized() (reward8.Spacetime, error) {
 	return s.State.CumsumRealized, nil
 }
 
-func (s *state8) InitialPledgeForPower(qaPower abi.StoragePower, networkTotalPledge abi.TokenAmount, networkQAPower *builtin.FilterEstimate, circSupply abi.TokenAmount) (abi.TokenAmount, error) {
+func (s *state8) InitialPledgeForPower(qaPower abi.StoragePower, _ abi.TokenAmount, networkQAPower *builtin.FilterEstimate, circSupply abi.TokenAmount, epochsSinceRampStart int64, rampDurationEpochs uint64) (abi.TokenAmount, error) {
 	return miner8.InitialPledgeForPower(
 		qaPower,
 		s.State.ThisEpochBaselinePower,
@@ -95,4 +100,21 @@ func (s *state8) PreCommitDepositForPower(networkQAPower builtin.FilterEstimate,
 
 func (s *state8) GetState() interface{} {
 	return &s.State
+}
+
+func (s *state8) ActorKey() string {
+	return manifest.RewardKey
+}
+
+func (s *state8) ActorVersion() actorstypes.Version {
+	return actorstypes.Version8
+}
+
+func (s *state8) Code() cid.Cid {
+	code, ok := actors.GetActorCodeID(s.ActorVersion(), s.ActorKey())
+	if !ok {
+		panic(fmt.Errorf("didn't find actor %v code id for actor version %d", s.ActorKey(), s.ActorVersion()))
+	}
+
+	return code
 }

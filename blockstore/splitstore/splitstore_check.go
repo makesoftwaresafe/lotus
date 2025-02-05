@@ -15,7 +15,7 @@ import (
 	"github.com/filecoin-project/lotus/chain/types"
 )
 
-// performs an asynchronous health-check on the splitstore; results are appended to
+// Check performs an asynchronous health-check on the splitstore; results are appended to
 // <splitstore-path>/check.txt
 func (s *SplitStore) Check() error {
 	s.headChangeMx.Lock()
@@ -25,6 +25,7 @@ func (s *SplitStore) Check() error {
 	if !atomic.CompareAndSwapInt32(&s.compacting, 0, 1) {
 		return xerrors.Errorf("can't acquire compaction lock; compacting operation in progress")
 	}
+	s.compactType = check
 
 	if s.compactionIndex == 0 {
 		atomic.StoreInt32(&s.compacting, 0)
@@ -94,7 +95,7 @@ func (s *SplitStore) doCheck(curTs *types.TipSet) error {
 	}
 	defer visitor.Close() //nolint
 
-	err = s.walkChain(curTs, boundaryEpoch, boundaryEpoch, visitor,
+	size := s.walkChain(curTs, boundaryEpoch, boundaryEpoch, visitor,
 		func(c cid.Cid) error {
 			if isUnitaryObject(c) {
 				return errStopWalk
@@ -124,7 +125,7 @@ func (s *SplitStore) doCheck(curTs *types.TipSet) error {
 			}
 
 			return nil
-		})
+		}, func(cid.Cid) error { return nil })
 
 	if err != nil {
 		err = xerrors.Errorf("error walking chain: %w", err)
@@ -132,7 +133,7 @@ func (s *SplitStore) doCheck(curTs *types.TipSet) error {
 		return err
 	}
 
-	log.Infow("check done", "cold", *coldCnt, "missing", *missingCnt)
+	log.Infow("check done", "cold", *coldCnt, "missing", *missingCnt, "walk size", size)
 	write("--")
 	write("cold: %d missing: %d", *coldCnt, *missingCnt)
 	write("DONE")
@@ -140,12 +141,14 @@ func (s *SplitStore) doCheck(curTs *types.TipSet) error {
 	return nil
 }
 
-// provides some basic information about the splitstore
+// Info provides some basic information about the splitstore
 func (s *SplitStore) Info() map[string]interface{} {
 	info := make(map[string]interface{})
 	info["base epoch"] = s.baseEpoch
-	info["warmup epoch"] = s.warmupEpoch
+	info["warmup epoch"] = s.warmupEpoch.Load()
 	info["compactions"] = s.compactionIndex
+	info["prunes"] = s.pruneIndex
+	info["compacting"] = s.compacting == 1
 
 	sizer, ok := s.hot.(bstore.BlockstoreSize)
 	if ok {

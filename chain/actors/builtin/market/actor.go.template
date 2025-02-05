@@ -1,7 +1,9 @@
 package market
 
 import (
-	"unicode/utf8"
+	"github.com/ipfs/go-cid"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+    "unicode/utf8"
 
 	"github.com/filecoin-project/go-state-types/network"
 	"golang.org/x/xerrors"
@@ -11,15 +13,17 @@ import (
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/cbor"
 	cbg "github.com/whyrusleeping/cbor-gen"
+	"github.com/filecoin-project/go-state-types/manifest"
 
-	market{{.latestVersion}} "github.com/filecoin-project/go-state-types/builtin{{import .latestVersion}}market"
+	markettypes "github.com/filecoin-project/go-state-types/builtin/v9/market"
+	verifregtypes "github.com/filecoin-project/go-state-types/builtin/v9/verifreg"
 {{range .versions}}
     {{if (le . 7)}}
 	    builtin{{.}} "github.com/filecoin-project/specs-actors{{import .}}actors/builtin"
-	{{else}}
-        builtin{{.}} "github.com/filecoin-project/go-state-types/builtin"
     {{end}}
 {{end}}
+
+    builtintypes "github.com/filecoin-project/go-state-types/builtin"
 
 	"github.com/filecoin-project/lotus/chain/actors/adt"
 	"github.com/filecoin-project/lotus/chain/actors"
@@ -27,20 +31,20 @@ import (
 )
 
 var (
-	Address = builtin{{.latestVersion}}.StorageMarketActorAddr
-	Methods = builtin{{.latestVersion}}.MethodsMarket
+	Address = builtintypes.StorageMarketActorAddr
+	Methods = builtintypes.MethodsMarket
 )
 
 func Load(store adt.Store, act *types.Actor) (State, error) {
 	if name, av, ok := actors.GetActorMetaByCode(act.Code); ok {
-       if name != actors.MarketKey {
+       if name != manifest.MarketKey {
           return nil, xerrors.Errorf("actor code is not market: %s", name)
        }
 
        switch av {
             {{range .versions}}
                 {{if (ge . 8)}}
-                case actors.Version{{.}}:
+                case actorstypes.Version{{.}}:
                      return load{{.}}(store, act.Head)
                  {{end}}
             {{end}}
@@ -59,10 +63,10 @@ func Load(store adt.Store, act *types.Actor) (State, error) {
 	return nil, xerrors.Errorf("unknown actor code %s", act.Code)
 }
 
-func MakeState(store adt.Store, av actors.Version) (State, error) {
+func MakeState(store adt.Store, av actorstypes.Version) (State, error) {
 	switch av {
 {{range .versions}}
-	case actors.Version{{.}}:
+	case actorstypes.Version{{.}}:
 		return make{{.}}(store)
 {{end}}
 }
@@ -71,6 +75,11 @@ func MakeState(store adt.Store, av actors.Version) (State, error) {
 
 type State interface {
 	cbor.Marshaler
+
+    Code() cid.Cid
+    ActorKey() string
+    ActorVersion() actorstypes.Version
+
 	BalancesChanged(State) (bool, error)
 	EscrowTable() (BalanceTable, error)
 	LockedTable() (BalanceTable, error)
@@ -79,11 +88,13 @@ type State interface {
 	States() (DealStates, error)
 	ProposalsChanged(State) (bool, error)
 	Proposals() (DealProposals, error)
+	PendingProposals() (PendingProposals, error)
 	VerifyDealsForActivation(
 		minerAddr address.Address, deals []abi.DealID, currEpoch, sectorExpiry abi.ChainEpoch,
-	) (weight, verifiedWeight abi.DealWeight, err error)
+	) (verifiedWeight abi.DealWeight, err error)
 	NextID() (abi.DealID, error)
 	GetState() interface{}
+	GetAllocationIdForPendingDeal(dealId abi.DealID) (verifregtypes.AllocationId, error)
 }
 
 type BalanceTable interface {
@@ -93,20 +104,23 @@ type BalanceTable interface {
 
 type DealStates interface {
 	ForEach(cb func(id abi.DealID, ds DealState) error) error
-	Get(id abi.DealID) (*DealState, bool, error)
+	Get(id abi.DealID) (DealState, bool, error)
 
 	array() adt.Array
-	decode(*cbg.Deferred) (*DealState, error)
+	decode(*cbg.Deferred) (DealState, error)
 }
 
 type DealProposals interface {
-	ForEach(cb func(id abi.DealID, dp market{{.latestVersion}}.DealProposal) error) error
-	Get(id abi.DealID) (*market{{.latestVersion}}.DealProposal, bool, error)
+	ForEach(cb func(id abi.DealID, dp markettypes.DealProposal) error) error
+	Get(id abi.DealID) (*markettypes.DealProposal, bool, error)
 
 	array() adt.Array
-	decode(*cbg.Deferred) (*market{{.latestVersion}}.DealProposal, error)
+	decode(*cbg.Deferred) (*markettypes.DealProposal, error)
 }
 
+type PendingProposals interface {
+    Has(proposalCid cid.Cid) (bool, error)
+}
 
 type PublishStorageDealsReturn interface {
     DealIDs() ([]abi.DealID, error)
@@ -115,23 +129,47 @@ type PublishStorageDealsReturn interface {
 }
 
 func DecodePublishStorageDealsReturn(b []byte, nv network.Version) (PublishStorageDealsReturn, error) {
-	av, err := actors.VersionForNetwork(nv)
+	av, err := actorstypes.VersionForNetwork(nv)
 	if err != nil {
 		return nil, err
 	}
 
 	switch av {
 {{range .versions}}
-	case actors.Version{{.}}:
+	case actorstypes.Version{{.}}:
 		return decodePublishStorageDealsReturn{{.}}(b)
 {{end}}
 }
 	return nil, xerrors.Errorf("unknown actor version %d", av)
 }
 
-type DealProposal = market{{.latestVersion}}.DealProposal
+type DealProposal = markettypes.DealProposal
+type DealLabel = markettypes.DealLabel
 
-type DealState = market{{.latestVersion}}.DealState
+type DealState interface {
+	SectorNumber() abi.SectorNumber   // 0 if not yet included in proven sector (0 is also a valid sector number)
+	SectorStartEpoch() abi.ChainEpoch // -1 if not yet included in proven sector
+	LastUpdatedEpoch() abi.ChainEpoch // -1 if deal state never updated
+	SlashEpoch() abi.ChainEpoch       // -1 if deal never slashed
+
+	Equals(other DealState) bool
+}
+
+func DealStatesEqual(a, b DealState) bool {
+	if a.SectorNumber() != b.SectorNumber() {
+		return false
+	}
+	if a.SectorStartEpoch() != b.SectorStartEpoch() {
+		return false
+	}
+	if a.LastUpdatedEpoch() != b.LastUpdatedEpoch() {
+		return false
+	}
+	if a.SlashEpoch() != b.SlashEpoch() {
+		return false
+	}
+	return true
+}
 
 type DealStateChanges struct {
 	Added	 []DealIDState
@@ -147,8 +185,8 @@ type DealIDState struct {
 // DealStateChange is a change in deal state from -> to
 type DealStateChange struct {
 	ID	 abi.DealID
-	From *DealState
-	To	 *DealState
+	From DealState
+	To	 DealState
 }
 
 type DealProposalChanges struct {
@@ -158,19 +196,38 @@ type DealProposalChanges struct {
 
 type ProposalIDState struct {
 	ID		 abi.DealID
-	Proposal market{{.latestVersion}}.DealProposal
+	Proposal markettypes.DealProposal
 }
 
-func EmptyDealState() *DealState {
-	return &DealState{
-		SectorStartEpoch: -1,
-		SlashEpoch:		  -1,
-		LastUpdatedEpoch: -1,
-	}
+
+type emptyDealState struct{}
+
+func (e *emptyDealState) SectorNumber() abi.SectorNumber {
+	return 0
+}
+
+func (e *emptyDealState) SectorStartEpoch() abi.ChainEpoch {
+	return -1
+}
+
+func (e *emptyDealState) LastUpdatedEpoch() abi.ChainEpoch {
+	return -1
+}
+
+func (e *emptyDealState) SlashEpoch() abi.ChainEpoch {
+	return -1
+}
+
+func (e *emptyDealState) Equals(other DealState) bool {
+	return DealStatesEqual(e, other)
+}
+
+func EmptyDealState() DealState {
+	return &emptyDealState{}
 }
 
 // returns the earned fees and pending fees for a given deal
-func GetDealFees(deal market{{.latestVersion}}.DealProposal, height abi.ChainEpoch) (abi.TokenAmount, abi.TokenAmount) {
+func GetDealFees(deal markettypes.DealProposal, height abi.ChainEpoch) (abi.TokenAmount, abi.TokenAmount) {
 	   tf := big.Mul(deal.StoragePricePerEpoch, big.NewInt(int64(deal.EndEpoch-deal.StartEpoch)))
 
 	   ef := big.Mul(deal.StoragePricePerEpoch, big.NewInt(int64(height-deal.StartEpoch)))
@@ -185,10 +242,21 @@ func GetDealFees(deal market{{.latestVersion}}.DealProposal, height abi.ChainEpo
 	   return ef, big.Sub(tf, ef)
 }
 
-func labelFromGoString(s string) (market{{.latestVersion}}.DealLabel, error) {
+func IsDealActive(state DealState) bool {
+	return state.SectorStartEpoch() > -1 && state.SlashEpoch() == -1
+}
+
+func labelFromGoString(s string) (markettypes.DealLabel, error) {
 	if utf8.ValidString(s) {
-		return market{{.latestVersion}}.NewLabelFromString(s)
+		return markettypes.NewLabelFromString(s)
 	} else {
-		return market{{.latestVersion}}.NewLabelFromBytes([]byte(s))
+		return markettypes.NewLabelFromBytes([]byte(s))
 	}
+}
+
+func AllCodes() []cid.Cid {
+	return []cid.Cid{ {{range .versions}}
+        (&state{{.}}{}).Code(),
+    {{- end}}
+    }
 }

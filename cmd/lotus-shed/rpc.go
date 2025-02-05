@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -68,7 +67,7 @@ var rpcCmd = &cli.Command{
 		cs := readline.NewCancelableStdin(afmt.Stdin)
 		go func() {
 			<-ctx.Done()
-			cs.Close() // nolint:errcheck
+			_ = cs.Close()
 		}()
 
 		send := func(method, params string) error {
@@ -97,7 +96,7 @@ var rpcCmd = &cli.Command{
 				return err
 			}
 
-			rb, err := ioutil.ReadAll(resp.Body)
+			rb, err := io.ReadAll(resp.Body)
 			if err != nil {
 				return err
 			}
@@ -112,8 +111,8 @@ var rpcCmd = &cli.Command{
 		}
 
 		if cctx.Args().Present() {
-			if cctx.Args().Len() > 2 {
-				return xerrors.Errorf("expected 1 or 2 arguments: method [params]")
+			if cctx.NArg() > 2 {
+				return lcli.ShowHelp(cctx, xerrors.Errorf("expected 1 or 2 arguments: method [params]"))
 			}
 
 			params := cctx.Args().Get(1)
@@ -149,9 +148,8 @@ var rpcCmd = &cli.Command{
 			if err == readline.ErrInterrupt {
 				if len(line) == 0 {
 					break
-				} else {
-					continue
 				}
+				continue
 			} else if err == io.EOF {
 				break
 			}

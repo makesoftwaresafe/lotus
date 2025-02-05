@@ -1,11 +1,10 @@
-//stm: #unit
 package splitstore
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
-	"math/rand"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,6 +14,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
+	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
 	mh "github.com/multiformats/go-multihash"
 
@@ -31,12 +31,13 @@ func init() {
 	CompactionBoundary = 2
 	WarmupBoundary = 0
 	SyncWaitTime = time.Millisecond
-	logging.SetLogLevel("splitstore", "DEBUG")
+	_ = logging.SetLogLevel("splitstore", "DEBUG")
 }
 
 func testSplitStore(t *testing.T, cfg *Config) {
 	ctx := context.Background()
 	chain := &mockChain{t: t}
+	fmt.Printf("Config: %v\n", cfg)
 
 	// the myriads of stores
 	ds := dssync.MutexWrap(datastore.NewMapDatastore())
@@ -221,28 +222,19 @@ func testSplitStore(t *testing.T, cfg *Config) {
 }
 
 func TestSplitStoreCompaction(t *testing.T) {
-	//stm: @SPLITSTORE_SPLITSTORE_OPEN_001, @SPLITSTORE_SPLITSTORE_CLOSE_001
-	//stm: @SPLITSTORE_SPLITSTORE_PUT_001, @SPLITSTORE_SPLITSTORE_ADD_PROTECTOR_001
-	//stm: @SPLITSTORE_SPLITSTORE_CLOSE_001
-	testSplitStore(t, &Config{MarkSetType: "map"})
+	testSplitStore(t, &Config{MarkSetType: "map", UniversalColdBlocks: true})
 }
 
 func TestSplitStoreCompactionWithBadger(t *testing.T) {
-	//stm: @SPLITSTORE_SPLITSTORE_OPEN_001, @SPLITSTORE_SPLITSTORE_CLOSE_001
-	//stm: @SPLITSTORE_SPLITSTORE_PUT_001, @SPLITSTORE_SPLITSTORE_ADD_PROTECTOR_001
-	//stm: @SPLITSTORE_SPLITSTORE_CLOSE_001
 	bs := badgerMarkSetBatchSize
 	badgerMarkSetBatchSize = 1
 	t.Cleanup(func() {
 		badgerMarkSetBatchSize = bs
 	})
-	testSplitStore(t, &Config{MarkSetType: "badger"})
+	testSplitStore(t, &Config{MarkSetType: "badger", UniversalColdBlocks: true})
 }
 
 func TestSplitStoreSuppressCompactionNearUpgrade(t *testing.T) {
-	//stm: @SPLITSTORE_SPLITSTORE_OPEN_001, @SPLITSTORE_SPLITSTORE_CLOSE_001
-	//stm: @SPLITSTORE_SPLITSTORE_PUT_001, @SPLITSTORE_SPLITSTORE_ADD_PROTECTOR_001
-	//stm: @SPLITSTORE_SPLITSTORE_CLOSE_001
 	ctx := context.Background()
 	chain := &mockChain{t: t}
 
@@ -282,7 +274,7 @@ func TestSplitStoreSuppressCompactionNearUpgrade(t *testing.T) {
 	path := t.TempDir()
 
 	// open the splitstore
-	ss, err := Open(path, ds, hot, cold, &Config{MarkSetType: "map"})
+	ss, err := Open(path, ds, hot, cold, &Config{MarkSetType: "map", UniversalColdBlocks: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,13 +413,13 @@ func testSplitStoreReification(t *testing.T, f func(context.Context, blockstore.
 
 	path := t.TempDir()
 
-	ss, err := Open(path, ds, hot, cold, &Config{MarkSetType: "map"})
+	ss, err := Open(path, ds, hot, cold, &Config{MarkSetType: "map", UniversalColdBlocks: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ss.Close() //nolint
 
-	ss.warmupEpoch = 1
+	ss.warmupEpoch.Store(1)
 	go ss.reifyOrchestrator()
 
 	waitForReification := func() {
@@ -521,13 +513,13 @@ func testSplitStoreReificationLimit(t *testing.T, f func(context.Context, blocks
 
 	path := t.TempDir()
 
-	ss, err := Open(path, ds, hot, cold, &Config{MarkSetType: "map"})
+	ss, err := Open(path, ds, hot, cold, &Config{MarkSetType: "map", UniversalColdBlocks: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ss.Close() //nolint
 
-	ss.warmupEpoch = 1
+	ss.warmupEpoch.Store(1)
 	go ss.reifyOrchestrator()
 
 	waitForReification := func() {
@@ -697,7 +689,7 @@ func (b *mockStore) Get(_ context.Context, cid cid.Cid) (blocks.Block, error) {
 
 	blk, ok := b.set[b.keyOf(cid)]
 	if !ok {
-		return nil, blockstore.ErrNotFound
+		return nil, ipld.ErrNotFound{Cid: cid}
 	}
 	return blk, nil
 }
@@ -754,6 +746,8 @@ func (b *mockStore) DeleteMany(_ context.Context, cids []cid.Cid) error {
 	}
 	return nil
 }
+
+func (b *mockStore) Flush(context.Context) error { return nil }
 
 func (b *mockStore) AllKeysChan(ctx context.Context) (<-chan cid.Cid, error) {
 	return nil, errors.New("not implemented")

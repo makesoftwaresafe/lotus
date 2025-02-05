@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,8 +24,9 @@ import (
 	badgerbs "github.com/filecoin-project/lotus/blockstore/badger"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/node/config"
-	"github.com/filecoin-project/lotus/storage/paths"
 	"github.com/filecoin-project/lotus/storage/sealer/fsutil"
+	"github.com/filecoin-project/lotus/storage/sealer/storiface"
+	"github.com/filecoin-project/lotus/system"
 )
 
 const (
@@ -37,6 +37,7 @@ const (
 	fsDatastore     = "datastore"
 	fsLock          = "repo.lock"
 	fsKeystore      = "keystore"
+	fsChainIndex    = "chainindex"
 )
 
 func NewRepoTypeFromString(t string) RepoType {
@@ -73,11 +74,6 @@ type RepoType interface {
 	APIInfoEnvVars() (string, []string, []string)
 }
 
-// SupportsStagingDeals is a trait for services that support staging deals
-type SupportsStagingDeals interface {
-	SupportsStagingDeals()
-}
-
 var FullNode fullNode
 
 type fullNode struct {
@@ -107,8 +103,6 @@ var StorageMiner storageMiner
 
 type storageMiner struct{}
 
-func (storageMiner) SupportsStagingDeals() {}
-
 func (storageMiner) Type() string {
 	return "StorageMiner"
 }
@@ -128,35 +122,6 @@ func (storageMiner) RepoFlags() []string {
 func (storageMiner) APIInfoEnvVars() (primary string, fallbacks []string, deprecated []string) {
 	// TODO remove deprecated deprecation period
 	return "MINER_API_INFO", nil, []string{"STORAGE_API_INFO"}
-}
-
-var Markets markets
-
-type markets struct{}
-
-func (markets) SupportsStagingDeals() {}
-
-func (markets) Type() string {
-	return "Markets"
-}
-
-func (markets) Config() interface{} {
-	return config.DefaultStorageMiner()
-}
-
-func (markets) APIFlags() []string {
-	// support split markets-miner and monolith deployments.
-	return []string{"markets-api-url", "miner-api-url"}
-}
-
-func (markets) RepoFlags() []string {
-	// support split markets-miner and monolith deployments.
-	return []string{"markets-repo", "miner-repo"}
-}
-
-func (markets) APIInfoEnvVars() (primary string, fallbacks []string, deprecated []string) {
-	// support split markets-miner and monolith deployments.
-	return "MARKETS_API_INFO", []string{"MINER_API_INFO"}, nil
 }
 
 type worker struct {
@@ -263,7 +228,7 @@ func (fsr *FsRepo) Init(t RepoType) error {
 	}
 
 	log.Infof("Initializing repo at '%s'", fsr.path)
-	err = os.MkdirAll(fsr.path, 0755) //nolint: gosec
+	err = os.MkdirAll(fsr.path, 0755)
 	if err != nil && !os.IsExist(err) {
 		return err
 	}
@@ -321,13 +286,13 @@ func (fsr *FsRepo) APIEndpoint() (multiaddr.Multiaddr, error) {
 
 	f, err := os.Open(p)
 	if os.IsNotExist(err) {
-		return nil, ErrNoAPIEndpoint
+		return nil, xerrors.Errorf("No file (%s): %w", p, ErrNoAPIEndpoint)
 	} else if err != nil {
 		return nil, err
 	}
 	defer f.Close() //nolint: errcheck // Read only op
 
-	data, err := ioutil.ReadAll(f)
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to read %q: %w", p, err)
 	}
@@ -352,7 +317,7 @@ func (fsr *FsRepo) APIToken() ([]byte, error) {
 	}
 	defer f.Close() //nolint: errcheck // Read only op
 
-	tb, err := ioutil.ReadAll(f)
+	tb, err := io.ReadAll(f)
 	if err != nil {
 		return nil, err
 	}
@@ -382,7 +347,7 @@ func (fsr *FsRepo) Lock(repoType RepoType) (LockedRepo, error) {
 	}, nil
 }
 
-// Like Lock, except datastores will work in read-only mode
+// LockRO is like Lock, except datastores will work in read-only mode
 func (fsr *FsRepo) LockRO(repoType RepoType) (LockedRepo, error) {
 	lr, err := fsr.Lock(repoType)
 	if err != nil {
@@ -410,6 +375,10 @@ type fsLockedRepo struct {
 	ssPath string
 	ssErr  error
 	ssOnce sync.Once
+
+	chainIndexPath string
+	chainIndexErr  error
+	chainIndexOnce sync.Once
 
 	storageLk sync.Mutex
 	configLk  sync.Mutex
@@ -474,19 +443,8 @@ func (fsr *fsLockedRepo) Blockstore(ctx context.Context, domain BlockstoreDomain
 			return
 		}
 
-		//
-		// Tri-state environment variable LOTUS_CHAIN_BADGERSTORE_DISABLE_FSYNC
-		// - unset == the default (currently fsync enabled)
-		// - set with a false-y value == fsync enabled no matter what a future default is
-		// - set with any other value == fsync is disabled ignored defaults (recommended for day-to-day use)
-		//
-		if nosyncBs, nosyncBsSet := os.LookupEnv("LOTUS_CHAIN_BADGERSTORE_DISABLE_FSYNC"); nosyncBsSet {
-			nosyncBs = strings.ToLower(nosyncBs)
-			if nosyncBs == "" || nosyncBs == "0" || nosyncBs == "false" || nosyncBs == "no" {
-				opts.SyncWrites = true
-			} else {
-				opts.SyncWrites = false
-			}
+		if system.BadgerFsyncDisable {
+			opts.SyncWrites = false
 		}
 
 		bs, err := badgerbs.Open(opts)
@@ -515,6 +473,21 @@ func (fsr *fsLockedRepo) SplitstorePath() (string, error) {
 	return fsr.ssPath, fsr.ssErr
 }
 
+func (fsr *fsLockedRepo) ChainIndexPath() (string, error) {
+	fsr.chainIndexOnce.Do(func() {
+		path := fsr.join(fsChainIndex)
+
+		if err := os.MkdirAll(path, 0755); err != nil {
+			fsr.chainIndexErr = err
+			return
+		}
+
+		fsr.chainIndexPath = path
+	})
+
+	return fsr.chainIndexPath, fsr.chainIndexErr
+}
+
 // join joins path elements with fsr.path
 func (fsr *fsLockedRepo) join(paths ...string) string {
 	return filepath.Join(append([]string{fsr.path}, paths...)...)
@@ -535,7 +508,15 @@ func (fsr *fsLockedRepo) Config() (interface{}, error) {
 }
 
 func (fsr *fsLockedRepo) loadConfigFromDisk() (interface{}, error) {
-	return config.FromFile(fsr.configPath, fsr.repoType.Config())
+	var opts []config.LoadCfgOpt
+	if fsr.repoType == FullNode {
+		opts = append(opts, config.SetCanFallbackOnDefault(config.NoDefaultForSplitstoreTransition))
+		opts = append(opts, config.SetValidate(config.ValidateSplitstoreSet))
+	}
+	opts = append(opts, config.SetDefault(func() (interface{}, error) {
+		return fsr.repoType.Config(), nil
+	}))
+	return config.FromFile(fsr.configPath, opts...)
 }
 
 func (fsr *fsLockedRepo) SetConfig(c func(interface{})) error {
@@ -564,7 +545,7 @@ func (fsr *fsLockedRepo) SetConfig(c func(interface{})) error {
 	}
 
 	// write buffer of TOML bytes to config file
-	err = ioutil.WriteFile(fsr.configPath, buf.Bytes(), 0644)
+	err = os.WriteFile(fsr.configPath, buf.Bytes(), 0644)
 	if err != nil {
 		return err
 	}
@@ -572,26 +553,26 @@ func (fsr *fsLockedRepo) SetConfig(c func(interface{})) error {
 	return nil
 }
 
-func (fsr *fsLockedRepo) GetStorage() (paths.StorageConfig, error) {
+func (fsr *fsLockedRepo) GetStorage() (storiface.StorageConfig, error) {
 	fsr.storageLk.Lock()
 	defer fsr.storageLk.Unlock()
 
 	return fsr.getStorage(nil)
 }
 
-func (fsr *fsLockedRepo) getStorage(def *paths.StorageConfig) (paths.StorageConfig, error) {
+func (fsr *fsLockedRepo) getStorage(def *storiface.StorageConfig) (storiface.StorageConfig, error) {
 	c, err := config.StorageFromFile(fsr.join(fsStorageConfig), def)
 	if err != nil {
-		return paths.StorageConfig{}, err
+		return storiface.StorageConfig{}, err
 	}
 	return *c, nil
 }
 
-func (fsr *fsLockedRepo) SetStorage(c func(*paths.StorageConfig)) error {
+func (fsr *fsLockedRepo) SetStorage(c func(*storiface.StorageConfig)) error {
 	fsr.storageLk.Lock()
 	defer fsr.storageLk.Unlock()
 
-	sc, err := fsr.getStorage(&paths.StorageConfig{})
+	sc, err := fsr.getStorage(&storiface.StorageConfig{})
 	if err != nil {
 		return xerrors.Errorf("get storage: %w", err)
 	}
@@ -617,14 +598,14 @@ func (fsr *fsLockedRepo) SetAPIEndpoint(ma multiaddr.Multiaddr) error {
 	if err := fsr.stillValid(); err != nil {
 		return err
 	}
-	return ioutil.WriteFile(fsr.join(fsAPI), []byte(ma.String()), 0644)
+	return os.WriteFile(fsr.join(fsAPI), []byte(ma.String()), 0644)
 }
 
 func (fsr *fsLockedRepo) SetAPIToken(token []byte) error {
 	if err := fsr.stillValid(); err != nil {
 		return err
 	}
-	return ioutil.WriteFile(fsr.join(fsAPIToken), token, 0600)
+	return os.WriteFile(fsr.join(fsAPIToken), token, 0600)
 }
 
 func (fsr *fsLockedRepo) KeyStore() (types.KeyStore, error) {
@@ -693,7 +674,7 @@ func (fsr *fsLockedRepo) Get(name string) (types.KeyInfo, error) {
 	}
 	defer file.Close() //nolint: errcheck // read only op
 
-	data, err := ioutil.ReadAll(file)
+	data, err := io.ReadAll(file)
 	if err != nil {
 		return types.KeyInfo{}, xerrors.Errorf("reading key '%s': %w", name, err)
 	}
@@ -742,7 +723,7 @@ func (fsr *fsLockedRepo) put(rawName string, info types.KeyInfo, retries int) er
 		return xerrors.Errorf("encoding key '%s': %w", name, err)
 	}
 
-	err = ioutil.WriteFile(keyPath, keyData, 0600)
+	err = os.WriteFile(keyPath, keyData, 0600)
 	if err != nil {
 		return xerrors.Errorf("writing key '%s': %w", name, err)
 	}

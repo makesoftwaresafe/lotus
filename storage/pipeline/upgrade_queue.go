@@ -11,7 +11,7 @@ import (
 	"github.com/filecoin-project/lotus/chain/types"
 )
 
-func (m *Sealing) MarkForSnapUpgrade(ctx context.Context, id abi.SectorNumber) error {
+func (m *Sealing) MarkForUpgrade(ctx context.Context, id abi.SectorNumber) error {
 	si, err := m.GetSectorInfo(id)
 	if err != nil {
 		return xerrors.Errorf("getting sector info: %w", err)
@@ -21,17 +21,20 @@ func (m *Sealing) MarkForSnapUpgrade(ctx context.Context, id abi.SectorNumber) e
 		return xerrors.Errorf("unable to snap-up sectors not in the 'Proving' state")
 	}
 
-	if si.hasDeals() {
+	if si.hasData() {
 		return xerrors.Errorf("not a committed-capacity sector, has deals")
 	}
 
 	ts, err := m.Api.ChainHead(ctx)
 	if err != nil {
-		return xerrors.Errorf("couldnt get chain head: %w", err)
+		return xerrors.Errorf("couldn't get chain head: %w", err)
 	}
 	onChainInfo, err := m.Api.StateSectorGetInfo(ctx, m.maddr, id, ts.Key())
 	if err != nil {
 		return xerrors.Errorf("failed to read sector on chain info: %w", err)
+	}
+	if onChainInfo == nil {
+		return xerrors.Errorf("sector not found %d", id)
 	}
 
 	active, err := m.sectorActive(ctx, ts.Key(), id)

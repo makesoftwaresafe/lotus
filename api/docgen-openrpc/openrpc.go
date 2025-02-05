@@ -1,8 +1,10 @@
 package docgenopenrpc
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"go/ast"
+	"io"
 	"net"
 	"reflect"
 
@@ -28,6 +30,37 @@ const integerD = `{
         }`
 
 const cidCidD = `{"title": "Content Identifier", "type": "string", "description": "Cid represents a self-describing content addressed identifier. It is formed by a Version, a Codec (which indicates a multicodec-packed content type) and a Multihash."}`
+
+func Generate(out io.Writer, iface, pkg string, ainfo docgen.ApiASTInfo, outGzip bool) error {
+	doc := NewLotusOpenRPCDocument(ainfo.Comments, ainfo.GroupComments)
+	i, _, _ := docgen.GetAPIType(iface, pkg)
+	doc.RegisterReceiverName("Filecoin", i)
+
+	dout, err := doc.Discover()
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case outGzip:
+		jsonOut, err := json.Marshal(dout)
+		if err != nil {
+			return err
+		}
+		writer := gzip.NewWriter(out)
+		if _, err = writer.Write(jsonOut); err != nil {
+			return err
+		}
+		return writer.Close()
+	default:
+		jsonOut, err := json.MarshalIndent(dout, "", "    ")
+		if err != nil {
+			return err
+		}
+		_, err = out.Write(jsonOut)
+		return err
+	}
+}
 
 func OpenRPCSchemaTypeMapper(ty reflect.Type) *jsonschema.Type {
 	unmarshalJSONToJSONSchemaType := func(input string) *jsonschema.Type {
@@ -65,7 +98,7 @@ func OpenRPCSchemaTypeMapper(ty reflect.Type) *jsonschema.Type {
 	// specific to our services.
 	switch ty.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		// Return all integer types as the hex representation integer schemea.
+		// Return all integer types as the hex representation integer schema.
 		ret := unmarshalJSONToJSONSchemaType(integerD)
 		return ret
 	case reflect.Uintptr:
@@ -106,7 +139,7 @@ func NewLotusOpenRPCDocument(Comments, GroupDocs map[string]string) *go_openrpc_
 			title := "Lotus RPC API"
 			info.Title = (*meta_schema.InfoObjectProperties)(&title)
 
-			version := build.BuildVersion
+			version := build.NodeBuildVersion
 			info.Version = (*meta_schema.InfoObjectVersion)(&version)
 			return info
 		},

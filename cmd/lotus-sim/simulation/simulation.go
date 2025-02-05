@@ -15,6 +15,7 @@ import (
 	"github.com/filecoin-project/go-state-types/network"
 	blockadt "github.com/filecoin-project/specs-actors/actors/util/adt"
 
+	"github.com/filecoin-project/lotus/chain/consensus"
 	"github.com/filecoin-project/lotus/chain/consensus/filcns"
 	"github.com/filecoin-project/lotus/chain/stmgr"
 	"github.com/filecoin-project/lotus/chain/types"
@@ -115,7 +116,7 @@ func (sim *Simulation) saveConfig() error {
 
 var simulationPrefix = datastore.NewKey("/simulation")
 
-// key returns the the key in the form /simulation/<subkey>/<simulation-name>. For example,
+// key returns the key in the form /simulation/<subkey>/<simulation-name>. For example,
 // /simulation/head/default.
 func (sim *Simulation) key(subkey string) datastore.Key {
 	return simulationPrefix.ChildString(subkey).ChildString(sim.name)
@@ -200,7 +201,8 @@ func (sim *Simulation) SetUpgradeHeight(nv network.Version, epoch abi.ChainEpoch
 	if err != nil {
 		return err
 	}
-	sm, err := stmgr.NewStateManager(sim.Node.Chainstore, filcns.NewTipSetExecutor(), vm.Syscalls(mock.Verifier), newUpgradeSchedule, nil)
+	sm, err := stmgr.NewStateManager(sim.Node.Chainstore, consensus.NewTipSetExecutor(filcns.RewardFunc),
+		vm.Syscalls(mock.Verifier), newUpgradeSchedule, nil, sim.Node.MetadataDS, nil)
 	if err != nil {
 		return err
 	}

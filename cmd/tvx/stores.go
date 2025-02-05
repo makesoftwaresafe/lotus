@@ -6,18 +6,19 @@ import (
 	"sync"
 
 	"github.com/fatih/color"
+	"github.com/ipfs/boxo/blockservice"
+	exchange "github.com/ipfs/boxo/exchange"
+	offline "github.com/ipfs/boxo/exchange/offline"
+	"github.com/ipfs/boxo/ipld/merkledag"
 	blocks "github.com/ipfs/go-block-format"
-	"github.com/ipfs/go-blockservice"
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
-	exchange "github.com/ipfs/go-ipfs-exchange-interface"
-	offline "github.com/ipfs/go-ipfs-exchange-offline"
 	cbor "github.com/ipfs/go-ipld-cbor"
 	format "github.com/ipfs/go-ipld-format"
-	"github.com/ipfs/go-merkledag"
+	"golang.org/x/xerrors"
 
-	"github.com/filecoin-project/lotus/api/v0api"
+	"github.com/filecoin-project/lotus/api/v1api"
 	"github.com/filecoin-project/lotus/blockstore"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
 )
@@ -38,7 +39,7 @@ type Stores struct {
 // NewProxyingStores is a set of Stores backed by a proxying Blockstore that
 // proxies Get requests for unknown CIDs to a Filecoin node, via the
 // ChainReadObj RPC.
-func NewProxyingStores(ctx context.Context, api v0api.FullNode) *Stores {
+func NewProxyingStores(ctx context.Context, api v1api.FullNode) *Stores {
 	ds := dssync.MutexWrap(ds.NewMapDatastore())
 	bs := &proxyingBlockstore{
 		ctx:        ctx,
@@ -83,7 +84,7 @@ type TracingBlockstore interface {
 // a Filecoin node via JSON-RPC.
 type proxyingBlockstore struct {
 	ctx context.Context
-	api v0api.FullNode
+	api v1api.FullNode
 
 	lk      sync.Mutex
 	tracing bool
@@ -157,4 +158,13 @@ func (pb *proxyingBlockstore) PutMany(ctx context.Context, blocks []blocks.Block
 	}
 	pb.lk.Unlock()
 	return pb.Blockstore.PutMany(ctx, blocks)
+}
+
+func (pb *proxyingBlockstore) View(ctx context.Context, c cid.Cid, callback func([]byte) error) error {
+	blk, err := pb.Get(ctx, c)
+	if err != nil {
+		return xerrors.Errorf("failed to Get cid %s: %w", c, err)
+	}
+
+	return callback(blk.RawData())
 }

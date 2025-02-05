@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
@@ -9,16 +10,22 @@ import (
 	"github.com/ipfs/go-datastore"
 	dsq "github.com/ipfs/go-datastore/query"
 	levelds "github.com/ipfs/go-ds-leveldb"
+	ipldcbor "github.com/ipfs/go-ipld-cbor"
 	logging "github.com/ipfs/go-log/v2"
 	ldbopts "github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/urfave/cli/v2"
+	cbg "github.com/whyrusleeping/cbor-gen"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/builtin"
+	market14 "github.com/filecoin-project/go-state-types/builtin/v14/market"
+	"github.com/filecoin-project/go-state-types/builtin/v14/util/adt"
 
 	"github.com/filecoin-project/lotus/chain/actors/builtin/market"
+	"github.com/filecoin-project/lotus/chain/types"
 	lcli "github.com/filecoin-project/lotus/cli"
 	"github.com/filecoin-project/lotus/lib/backupds"
 	"github.com/filecoin-project/lotus/node/repo"
@@ -32,6 +39,82 @@ var marketCmd = &cli.Command{
 		marketDealFeesCmd,
 		marketExportDatastoreCmd,
 		marketImportDatastoreCmd,
+		marketDealsTotalStorageCmd,
+		marketCronStateCmd,
+	},
+}
+
+var marketCronStateCmd = &cli.Command{
+	Name:  "cron-state",
+	Usage: "Display summary of all deal operation state scheduled for cron processing",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "tipset",
+			Usage: "specify tipset to call method on (pass comma separated array of cids)",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		ctx := lcli.ReqContext(cctx)
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+		ts, err := lcli.LoadTipSet(ctx, cctx, api)
+		if err != nil {
+			return err
+		}
+
+		bs := ReadOnlyAPIBlockstore{api}
+		adtStore := adt.WrapStore(ctx, ipldcbor.NewCborStore(&bs))
+
+		mAct, err := api.StateGetActor(ctx, builtin.StorageMarketActorAddr, ts.Key())
+		if err != nil {
+			return err
+		}
+
+		var mSt market14.State
+		err = adtStore.Get(ctx, mAct.Head, &mSt)
+		if err != nil {
+			return err
+		}
+
+		dealOpsEpochSet, err := adt.AsMap(adtStore, mSt.DealOpsByEpoch, builtin.DefaultHamtBitwidth)
+		if err != nil {
+			return err
+		}
+		dealOpsRecord := make(map[uint64][]abi.DealID)
+		if err := dealOpsEpochSet.ForEach(&cbg.Deferred{}, func(eKey string) error {
+			e, err := abi.ParseUIntKey(eKey)
+			if err != nil {
+				return err
+			}
+			dealOpsRecord[e] = make([]abi.DealID, 0)
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		dealOpsMultiMap, err := market14.AsSetMultimap(adtStore, mSt.DealOpsByEpoch, builtin.DefaultHamtBitwidth, builtin.DefaultHamtBitwidth)
+		if err != nil {
+			return err
+		}
+		for e := range dealOpsRecord {
+			e := e
+			err := dealOpsMultiMap.ForEach(abi.ChainEpoch(e), func(id abi.DealID) error {
+				dealOpsRecord[e] = append(dealOpsRecord[e], id)
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+		jsonStr, err := json.Marshal(dealOpsRecord)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s\n", jsonStr)
+		return nil
 	},
 }
 
@@ -131,7 +214,7 @@ var marketExportDatastoreCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		logging.SetLogLevel("badger", "ERROR") // nolint:errcheck
+		_ = logging.SetLogLevel("badger", "ERROR")
 
 		// If the backup dir is not specified, just use the OS temp dir
 		backupDir := cctx.String("backup-dir")
@@ -249,7 +332,7 @@ var marketImportDatastoreCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		logging.SetLogLevel("badger", "ERROR") // nolint:errcheck
+		_ = logging.SetLogLevel("badger", "ERROR")
 
 		backupPath := cctx.String("backup-path")
 
@@ -278,6 +361,42 @@ var marketImportDatastoreCmd = &cli.Command{
 		}
 
 		fmt.Println("Completed importing from backup file " + backupPath)
+
+		return nil
+	},
+}
+
+var marketDealsTotalStorageCmd = &cli.Command{
+	Name:  "get-deals-total-storage",
+	Usage: "View the total storage available in all active market deals",
+	Action: func(cctx *cli.Context) error {
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+
+		ctx := lcli.ReqContext(cctx)
+
+		deals, err := api.StateMarketDeals(ctx, types.EmptyTSK)
+		if err != nil {
+			return err
+		}
+
+		total := big.Zero()
+		count := 0
+
+		for _, deal := range deals {
+			if market.IsDealActive(deal.State.Iface()) {
+				dealStorage := big.NewIntUnsigned(uint64(deal.Proposal.PieceSize))
+				total = big.Add(total, dealStorage)
+				count++
+			}
+
+		}
+
+		fmt.Println("Total deals: ", count)
+		fmt.Println("Total storage: ", total)
 
 		return nil
 	},

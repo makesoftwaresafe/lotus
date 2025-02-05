@@ -9,8 +9,8 @@ import (
 
 	"github.com/filecoin-project/lotus/blockstore"
 	"github.com/filecoin-project/lotus/chain/types"
-	"github.com/filecoin-project/lotus/storage/paths"
 	"github.com/filecoin-project/lotus/storage/sealer/fsutil"
+	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
 // BlockstoreDomain represents the domain of a blockstore.
@@ -28,7 +28,7 @@ const (
 var (
 	ErrNoAPIEndpoint     = errors.New("API not running (no endpoint)")
 	ErrNoAPIToken        = errors.New("API token not set")
-	ErrRepoAlreadyLocked = errors.New("repo is already locked (lotus daemon already running)")
+	ErrRepoAlreadyLocked = errors.New("repo is already locked (process is already running)")
 	ErrClosedRepo        = errors.New("repo is no longer open")
 
 	// ErrInvalidBlockstoreDomain is returned by LockedRepo#Blockstore() when
@@ -69,12 +69,15 @@ type LockedRepo interface {
 	// SplitstorePath returns the path for the SplitStore
 	SplitstorePath() (string, error)
 
+	// ChainIndexPath returns the path for the chain index database
+	ChainIndexPath() (string, error)
+
 	// Returns config in this repo
 	Config() (interface{}, error)
 	SetConfig(func(interface{})) error
 
-	GetStorage() (paths.StorageConfig, error)
-	SetStorage(func(*paths.StorageConfig)) error
+	GetStorage() (storiface.StorageConfig, error)
+	SetStorage(func(*storiface.StorageConfig)) error
 	Stat(path string) (fsutil.FsStat, error)
 	DiskUsage(path string) (int64, error)
 

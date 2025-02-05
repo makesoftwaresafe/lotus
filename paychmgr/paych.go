@@ -2,6 +2,7 @@ package paychmgr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/ipfs/go-cid"
@@ -9,11 +10,11 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	cborutil "github.com/filecoin-project/go-cbor-util"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/builtin/v8/paych"
 
 	"github.com/filecoin-project/lotus/api"
-	"github.com/filecoin-project/lotus/chain/actors"
 	lpaych "github.com/filecoin-project/lotus/chain/actors/builtin/paych"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/lib/sigs"
@@ -89,7 +90,7 @@ func (ca *channelAccessor) messageBuilder(ctx context.Context, from address.Addr
 		return nil, err
 	}
 
-	av, err := actors.VersionForNetwork(nwVersion)
+	av, err := actorstypes.VersionForNetwork(nwVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +149,7 @@ func (ca *channelAccessor) createVoucher(ctx context.Context, ch address.Address
 		// If there are not enough funds in the channel to cover the voucher,
 		// return a voucher create result with the shortfall
 		var ife insufficientFundsErr
-		if xerrors.As(err, &ife) {
+		if errors.As(err, &ife) {
 			return &api.VoucherCreateResult{
 				Shortfall: ife.Shortfall(),
 			}, nil
@@ -211,7 +212,7 @@ func (ca *channelAccessor) checkVoucherValidUnlocked(ctx context.Context, ch add
 		return nil, err
 	}
 
-	from, err := ca.api.ResolveToKeyAddress(ctx, f, nil)
+	from, err := ca.api.ResolveToDeterministicAddress(ctx, f, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -482,7 +483,7 @@ func (ca *channelAccessor) listVouchers(ctx context.Context, ch address.Address)
 // the data store over the chain state
 func (ca *channelAccessor) laneState(ctx context.Context, state lpaych.State, ch address.Address) (map[uint64]lpaych.LaneState, error) {
 	// TODO: we probably want to call UpdateChannelState with all vouchers to be fully correct
-	//  (but technically dont't need to)
+	//  (but technically don't need to)
 
 	laneCount, err := state.LaneCount()
 	if err != nil {

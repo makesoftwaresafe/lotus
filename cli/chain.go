@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -35,9 +36,10 @@ import (
 	"github.com/filecoin-project/lotus/api"
 	lapi "github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/api/v0api"
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/actors"
-	"github.com/filecoin-project/lotus/chain/consensus/filcns"
+	"github.com/filecoin-project/lotus/chain/actors/policy"
+	"github.com/filecoin-project/lotus/chain/consensus"
 	"github.com/filecoin-project/lotus/chain/types"
 )
 
@@ -56,18 +58,26 @@ var ChainCmd = &cli.Command{
 		ChainGetCmd,
 		ChainBisectCmd,
 		ChainExportCmd,
+		ChainExportRangeCmd,
 		SlashConsensusFault,
 		ChainGasPriceCmd,
 		ChainInspectUsage,
 		ChainDecodeCmd,
 		ChainEncodeCmd,
 		ChainDisputeSetCmd,
+		ChainPruneCmd,
 	},
 }
 
 var ChainHeadCmd = &cli.Command{
 	Name:  "head",
 	Usage: "Print chain head",
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "height",
+			Usage: "print just the epoch number of the chain head",
+		},
+	},
 	Action: func(cctx *cli.Context) error {
 		afmt := NewAppFmt(cctx.App)
 
@@ -83,8 +93,12 @@ var ChainHeadCmd = &cli.Command{
 			return err
 		}
 
-		for _, c := range head.Cids() {
-			afmt.Println(c)
+		if cctx.Bool("height") {
+			afmt.Println(head.Height())
+		} else {
+			for _, c := range head.Cids() {
+				afmt.Println(c)
+			}
 		}
 		return nil
 	},
@@ -111,8 +125,8 @@ var ChainGetBlock = &cli.Command{
 		defer closer()
 		ctx := ReqContext(cctx)
 
-		if !cctx.Args().Present() {
-			return fmt.Errorf("must pass cid of block to print")
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		bcid, err := cid.Decode(cctx.Args().First())
@@ -148,7 +162,7 @@ var ChainGetBlock = &cli.Command{
 		recpts, err := api.ChainGetParentReceipts(ctx, bcid)
 		if err != nil {
 			log.Warn(err)
-			//return xerrors.Errorf("failed to get receipts: %w", err)
+			// return xerrors.Errorf("failed to get receipts: %w", err)
 		}
 
 		cblock := struct {
@@ -197,6 +211,10 @@ var ChainReadObjCmd = &cli.Command{
 		defer closer()
 		ctx := ReqContext(cctx)
 
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
+		}
+
 		c, err := cid.Decode(cctx.Args().First())
 		if err != nil {
 			return fmt.Errorf("failed to parse cid input: %s", err)
@@ -231,6 +249,10 @@ var ChainDeleteObjCmd = &cli.Command{
 		}
 		defer closer()
 		ctx := ReqContext(cctx)
+
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
+		}
 
 		c, err := cid.Decode(cctx.Args().First())
 		if err != nil {
@@ -275,6 +297,10 @@ var ChainStatObjCmd = &cli.Command{
 		defer closer()
 		ctx := ReqContext(cctx)
 
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
+		}
+
 		obj, err := cid.Decode(cctx.Args().First())
 		if err != nil {
 			return fmt.Errorf("failed to parse cid input: %s", err)
@@ -307,8 +333,8 @@ var ChainGetMsgCmd = &cli.Command{
 	Action: func(cctx *cli.Context) error {
 		afmt := NewAppFmt(cctx.App)
 
-		if !cctx.Args().Present() {
-			return fmt.Errorf("must pass a cid of a message to get")
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		api, closer, err := GetFullNodeAPI(cctx)
@@ -372,6 +398,10 @@ var ChainSetHeadCmd = &cli.Command{
 		}
 		defer closer()
 		ctx := ReqContext(cctx)
+
+		if !cctx.Bool("genesis") && !cctx.IsSet("epoch") && cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
+		}
 
 		var ts *types.TipSet
 
@@ -492,7 +522,7 @@ var ChainInspectUsage = &cli.Command{
 				return err
 			}
 
-			mm := filcns.NewActorRegistry().Methods[code][m.Message.Method] // TODO: use remote map
+			mm := consensus.NewActorRegistry().Methods[code][m.Message.Method] // TODO: use remote map
 
 			byMethod[mm.Name] += m.Message.GasLimit
 			byMethodC[mm.Name]++
@@ -551,12 +581,12 @@ var ChainListCmd = &cli.Command{
 	Aliases: []string{"love"},
 	Usage:   "View a segment of the chain",
 	Flags: []cli.Flag{
-		&cli.Uint64Flag{Name: "height", DefaultText: "current head"},
+		&cli.Uint64Flag{Name: "epoch", Aliases: []string{"height"}, DefaultText: "current head"},
 		&cli.IntFlag{Name: "count", Value: 30},
 		&cli.StringFlag{
 			Name:  "format",
-			Usage: "specify the format to print out tipsets",
-			Value: "<height>: (<time>) <blocks>",
+			Usage: "specify the format to print out tipsets using placeholders: <epoch>, <time>, <blocks>, <weight>, <tipset>, <json_tipset>\n",
+			Value: "<epoch>: (<time>) <blocks>",
 		},
 		&cli.BoolFlag{
 			Name:  "gas-stats",
@@ -612,7 +642,7 @@ var ChainListCmd = &cli.Command{
 			tss = otss
 			for i, ts := range tss {
 				pbf := ts.Blocks()[0].ParentBaseFee
-				afmt.Printf("%d: %d blocks (baseFee: %s -> maxFee: %s)\n", ts.Height(), len(ts.Blocks()), ts.Blocks()[0].ParentBaseFee, types.FIL(types.BigMul(pbf, types.NewInt(uint64(build.BlockGasLimit)))))
+				afmt.Printf("%d: %d blocks (baseFee: %s -> maxFee: %s)\n", ts.Height(), len(ts.Blocks()), ts.Blocks()[0].ParentBaseFee, types.FIL(types.BigMul(pbf, types.NewInt(uint64(buildconstants.BlockGasLimit)))))
 
 				for _, b := range ts.Blocks() {
 					msgs, err := api.ChainGetBlockMessages(ctx, b.Cid())
@@ -638,7 +668,7 @@ var ChainListCmd = &cli.Command{
 						avgpremium = big.Div(psum, big.NewInt(int64(lenmsgs)))
 					}
 
-					afmt.Printf("\t%s: \t%d msgs, gasLimit: %d / %d (%0.2f%%), avgPremium: %s\n", b.Miner, len(msgs.BlsMessages)+len(msgs.SecpkMessages), limitSum, build.BlockGasLimit, 100*float64(limitSum)/float64(build.BlockGasLimit), avgpremium)
+					afmt.Printf("\t%s: \t%d msgs, gasLimit: %d / %d (%0.2f%%), avgPremium: %s\n", b.Miner, len(msgs.BlsMessages)+len(msgs.SecpkMessages), limitSum, buildconstants.BlockGasLimit, 100*float64(limitSum)/float64(buildconstants.BlockGasLimit), avgpremium)
 				}
 				if i < len(tss)-1 {
 					msgs, err := api.ChainGetParentMessages(ctx, tss[i+1].Blocks()[0].Cid())
@@ -661,7 +691,7 @@ var ChainListCmd = &cli.Command{
 					}
 
 					gasEfficiency := 100 * float64(gasUsed) / float64(limitSum)
-					gasCapacity := 100 * float64(limitSum) / float64(build.BlockGasLimit)
+					gasCapacity := 100 * float64(limitSum) / float64(buildconstants.BlockGasLimit)
 
 					afmt.Printf("\ttipset: \t%d msgs, %d (%0.2f%%) / %d (%0.2f%%)\n", len(msgs), gasUsed, gasEfficiency, limitSum, gasCapacity)
 				}
@@ -732,6 +762,10 @@ var ChainGetCmd = &cli.Command{
 		}
 		defer closer()
 		ctx := ReqContext(cctx)
+
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
+		}
 
 		p := path.Clean(cctx.Args().First())
 		if strings.HasPrefix(p, "/pstate") {
@@ -841,7 +875,7 @@ func (ht *apiIpldStore) Get(ctx context.Context, c cid.Cid, out interface{}) err
 		return nil
 	}
 
-	return fmt.Errorf("Object does not implement CBORUnmarshaler")
+	return fmt.Errorf("object does not implement CBORUnmarshaler")
 }
 
 func (ht *apiIpldStore) Put(ctx context.Context, v interface{}) (cid.Cid, error) {
@@ -898,7 +932,9 @@ func handleHamtAddress(ctx context.Context, api v0api.FullNode, r cid.Cid) error
 }
 
 func printTipSet(format string, ts *types.TipSet, afmt *AppFmt) {
-	format = strings.ReplaceAll(format, "<height>", fmt.Sprint(ts.Height()))
+	format = strings.ReplaceAll(format, "<epoch>", fmt.Sprint(ts.Height()))
+	format = strings.ReplaceAll(format, "<height>", fmt.Sprint(ts.Height())) // backwards compatibility
+
 	format = strings.ReplaceAll(format, "<time>", time.Unix(int64(ts.MinTimestamp()), 0).Format(time.Stamp))
 	blks := "[ "
 	for _, b := range ts.Blocks() {
@@ -914,6 +950,16 @@ func printTipSet(format string, ts *types.TipSet, afmt *AppFmt) {
 
 	format = strings.ReplaceAll(format, "<tipset>", strings.Join(sCids, ","))
 	format = strings.ReplaceAll(format, "<blocks>", blks)
+	if strings.Contains(format, "<json_tipset>") {
+		jsonTipset, err := json.Marshal(ts)
+		if err != nil {
+			// should not happen
+			afmt.Println("Error encoding tipset to JSON:", err)
+			return
+		}
+		format = strings.ReplaceAll(format, "<json_tipset>", string(jsonTipset))
+	}
+
 	format = strings.ReplaceAll(format, "<weight>", fmt.Sprint(ts.Blocks()[0].ParentWeight))
 
 	afmt.Println(format)
@@ -946,8 +992,8 @@ var ChainBisectCmd = &cli.Command{
 		defer closer()
 		ctx := ReqContext(cctx)
 
-		if cctx.Args().Len() < 4 {
-			return xerrors.New("need at least 4 args")
+		if cctx.NArg() < 4 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		start, err := strconv.ParseUint(cctx.Args().Get(0), 10, 64)
@@ -1070,13 +1116,13 @@ var ChainExportCmd = &cli.Command{
 		defer closer()
 		ctx := ReqContext(cctx)
 
-		if !cctx.Args().Present() {
-			return fmt.Errorf("must specify filename to export chain to")
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		rsrs := abi.ChainEpoch(cctx.Int64("recent-stateroots"))
-		if cctx.IsSet("recent-stateroots") && rsrs < build.Finality {
-			return fmt.Errorf("\"recent-stateroots\" has to be greater than %d", build.Finality)
+		if cctx.IsSet("recent-stateroots") && rsrs < policy.ChainFinality {
+			return fmt.Errorf("\"recent-stateroots\" has to be greater than %d", policy.ChainFinality)
 		}
 
 		fi, err := createExportFile(cctx.App, cctx.Args().First())
@@ -1120,6 +1166,109 @@ var ChainExportCmd = &cli.Command{
 			return xerrors.Errorf("incomplete export (remote connection lost?)")
 		}
 
+		return nil
+	},
+}
+
+var ChainExportRangeCmd = &cli.Command{
+	Name:      "export-range",
+	Usage:     "export chain to a car file",
+	ArgsUsage: "",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "head",
+			Usage: "specify tipset to start the export from (higher epoch)",
+			Value: "@head",
+		},
+		&cli.StringFlag{
+			Name:  "tail",
+			Usage: "specify tipset to end the export at (lower epoch)",
+			Value: "@tail",
+		},
+		&cli.BoolFlag{
+			Name:  "messages",
+			Usage: "specify if messages should be include",
+			Value: false,
+		},
+		&cli.BoolFlag{
+			Name:  "receipts",
+			Usage: "specify if receipts should be include",
+			Value: false,
+		},
+		&cli.BoolFlag{
+			Name:  "stateroots",
+			Usage: "specify if stateroots should be include",
+			Value: false,
+		},
+		&cli.IntFlag{
+			Name:  "workers",
+			Usage: "specify the number of workers",
+			Value: 1,
+		},
+		&cli.IntFlag{
+			Name:  "write-buffer",
+			Usage: "specify write buffer size",
+			Value: 1 << 20,
+		},
+		&cli.BoolFlag{
+			Name:   "internal",
+			Usage:  "write the file locally to disk",
+			Value:  true,
+			Hidden: true, // currently, non-internal export is not implemented.
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		api, closer, err := GetFullNodeAPIV1(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+		ctx := ReqContext(cctx)
+
+		var head, tail *types.TipSet
+		headstr := cctx.String("head")
+		if headstr == "@head" {
+			head, err = api.ChainHead(ctx)
+			if err != nil {
+				return err
+			}
+		} else {
+			head, err = ParseTipSetRef(ctx, api, headstr)
+			if err != nil {
+				return fmt.Errorf("parsing head: %w", err)
+			}
+		}
+		tailstr := cctx.String("tail")
+		if tailstr == "@tail" {
+			tail, err = api.ChainGetGenesis(ctx)
+			if err != nil {
+				return err
+			}
+		} else {
+			tail, err = ParseTipSetRef(ctx, api, tailstr)
+			if err != nil {
+				return fmt.Errorf("parsing tail: %w", err)
+			}
+		}
+
+		if head.Height() < tail.Height() {
+			return errors.New("height of --head tipset must be greater or equal to the height of the --tail tipset")
+		}
+
+		if !cctx.Bool("internal") {
+			return errors.New("non-internal exports are not implemented")
+		}
+
+		err = api.ChainExportRangeInternal(ctx, head.Key(), tail.Key(), lapi.ChainExportConfig{
+			WriteBufferSize:   cctx.Int("write-buffer"),
+			NumWorkers:        cctx.Int("workers"),
+			IncludeMessages:   cctx.Bool("messages"),
+			IncludeReceipts:   cctx.Bool("receipts"),
+			IncludeStateRoots: cctx.Bool("stateroots"),
+		})
+		if err != nil {
+			return err
+		}
 		return nil
 	},
 }
@@ -1312,8 +1461,8 @@ var chainDecodeParamsCmd = &cli.Command{
 		defer closer()
 		ctx := ReqContext(cctx)
 
-		if cctx.Args().Len() != 3 {
-			return ShowHelp(cctx, fmt.Errorf("incorrect number of arguments"))
+		if cctx.NArg() != 3 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		to, err := address.NewFromString(cctx.Args().First())
@@ -1391,8 +1540,8 @@ var chainEncodeParamsCmd = &cli.Command{
 	Action: func(cctx *cli.Context) error {
 		afmt := NewAppFmt(cctx.App)
 
-		if cctx.Args().Len() != 3 {
-			return ShowHelp(cctx, fmt.Errorf("incorrect number of arguments"))
+		if cctx.NArg() != 3 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		method, err := strconv.ParseInt(cctx.Args().Get(1), 10, 64)
@@ -1461,4 +1610,102 @@ func createExportFile(app *cli.App, path string) (io.WriteCloser, error) {
 		return nil, err
 	}
 	return fi, nil
+}
+
+var ChainPruneCmd = &cli.Command{
+	Name:  "prune",
+	Usage: "splitstore gc",
+	Subcommands: []*cli.Command{
+		chainPruneColdCmd,
+		chainPruneHotGCCmd,
+		chainPruneHotMovingGCCmd,
+	},
+}
+
+var chainPruneHotGCCmd = &cli.Command{
+	Name:  "hot",
+	Usage: "run online (badger vlog) garbage collection on hotstore",
+	Flags: []cli.Flag{
+		&cli.Float64Flag{Name: "threshold", Value: 0.01, Usage: "Threshold of vlog garbage for gc"},
+		&cli.BoolFlag{Name: "periodic", Value: false, Usage: "Run periodic gc over multiple vlogs. Otherwise run gc once"},
+	},
+	Action: func(cctx *cli.Context) error {
+		api, closer, err := GetFullNodeAPIV1(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+		ctx := ReqContext(cctx)
+		opts := lapi.HotGCOpts{}
+		opts.Periodic = cctx.Bool("periodic")
+		opts.Threshold = cctx.Float64("threshold")
+
+		gcStart := time.Now()
+		err = api.ChainHotGC(ctx, opts)
+		gcTime := time.Since(gcStart)
+		fmt.Printf("Online GC took %v (periodic <%t> threshold <%f>)", gcTime, opts.Periodic, opts.Threshold)
+		return err
+	},
+}
+
+var chainPruneHotMovingGCCmd = &cli.Command{
+	Name:  "hot-moving",
+	Usage: "run moving gc on hotstore",
+	Action: func(cctx *cli.Context) error {
+		api, closer, err := GetFullNodeAPIV1(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+		ctx := ReqContext(cctx)
+		opts := lapi.HotGCOpts{}
+		opts.Moving = true
+
+		gcStart := time.Now()
+		err = api.ChainHotGC(ctx, opts)
+		gcTime := time.Since(gcStart)
+		fmt.Printf("Moving GC took %v", gcTime)
+		return err
+	},
+}
+
+var chainPruneColdCmd = &cli.Command{
+	Name:  "compact-cold",
+	Usage: "force splitstore compaction on cold store state and run gc",
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "online-gc",
+			Value: false,
+			Usage: "use online gc for garbage collecting the coldstore",
+		},
+		&cli.BoolFlag{
+			Name:  "moving-gc",
+			Value: false,
+			Usage: "use moving gc for garbage collecting the coldstore",
+		},
+		&cli.IntFlag{
+			Name:  "retention",
+			Value: -1,
+			Usage: "specify state retention policy",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		api, closer, err := GetFullNodeAPIV1(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+		ctx := ReqContext(cctx)
+
+		opts := lapi.PruneOpts{}
+		if cctx.Bool("online-gc") {
+			opts.MovingGC = false
+		}
+		if cctx.Bool("moving-gc") {
+			opts.MovingGC = true
+		}
+		opts.RetainState = int64(cctx.Int("retention"))
+
+		return api.ChainPrune(ctx, opts)
+	},
 }

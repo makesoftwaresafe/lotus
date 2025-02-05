@@ -2,15 +2,14 @@ package node
 
 import (
 	"context"
-	"encoding/json"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"runtime"
 	"strconv"
+	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
@@ -27,7 +26,6 @@ import (
 	"github.com/filecoin-project/lotus/metrics"
 	"github.com/filecoin-project/lotus/metrics/proxy"
 	"github.com/filecoin-project/lotus/node/impl"
-	"github.com/filecoin-project/lotus/node/impl/client"
 )
 
 var rpclog = logging.Logger("rpc")
@@ -47,9 +45,12 @@ func ServeRPC(h http.Handler, id string, addr multiaddr.Multiaddr) (StopFunc, er
 
 	// Instantiate the server and start listening.
 	srv := &http.Server{
-		Handler: h,
+		Handler:           h,
+		ReadHeaderTimeout: 30 * time.Second,
 		BaseContext: func(listener net.Listener) context.Context {
-			ctx, _ := tag.New(context.Background(), tag.Upsert(metrics.APIInterface, id))
+			ctx := context.Background()
+			ctx = metrics.AddNetworkTag(ctx)
+			ctx, _ = tag.New(ctx, tag.Upsert(metrics.APIInterface, id))
 			return ctx
 		},
 	}
@@ -69,9 +70,11 @@ func FullNodeHandler(a v1api.FullNode, permissioned bool, opts ...jsonrpc.Server
 	m := mux.NewRouter()
 
 	serveRpc := func(path string, hnd interface{}) {
-		rpcServer := jsonrpc.NewServer(opts...)
+		rpcServer := jsonrpc.NewServer(append(opts, jsonrpc.WithReverseClient[api.EthSubscriberMethods]("Filecoin"), jsonrpc.WithServerErrors(api.RPCErrors))...)
 		rpcServer.Register("Filecoin", hnd)
 		rpcServer.AliasMethod("rpc.discover", "Filecoin.Discover")
+
+		api.CreateEthRPCAliases(rpcServer)
 
 		var handler http.Handler = rpcServer
 		if permissioned {
@@ -86,28 +89,9 @@ func FullNodeHandler(a v1api.FullNode, permissioned bool, opts ...jsonrpc.Server
 		fnapi = api.PermissionedFullAPI(fnapi)
 	}
 
+	var v0 v0api.FullNode = &(struct{ v0api.FullNode }{&v0api.WrapperV1Full{FullNode: fnapi}})
 	serveRpc("/rpc/v1", fnapi)
-	serveRpc("/rpc/v0", &v0api.WrapperV1Full{FullNode: fnapi})
-
-	// Import handler
-	handleImportFunc := handleImport(a.(*impl.FullNodeAPI))
-	handleExportFunc := handleExport(a.(*impl.FullNodeAPI))
-	if permissioned {
-		importAH := &auth.Handler{
-			Verify: a.AuthVerify,
-			Next:   handleImportFunc,
-		}
-		m.Handle("/rest/v0/import", importAH)
-
-		exportAH := &auth.Handler{
-			Verify: a.AuthVerify,
-			Next:   handleExportFunc,
-		}
-		m.Handle("/rest/v0/export", exportAH)
-	} else {
-		m.HandleFunc("/rest/v0/import", handleImportFunc)
-		m.HandleFunc("/rest/v0/export", handleExportFunc)
-	}
+	serveRpc("/rpc/v0", v0)
 
 	// debugging
 	m.Handle("/debug/metrics", metrics.Exporter())
@@ -124,90 +108,55 @@ func FullNodeHandler(a v1api.FullNode, permissioned bool, opts ...jsonrpc.Server
 
 // MinerHandler returns a miner handler, to be mounted as-is on the server.
 func MinerHandler(a api.StorageMiner, permissioned bool) (http.Handler, error) {
-	m := mux.NewRouter()
-
 	mapi := proxy.MetricedStorMinerAPI(a)
 	if permissioned {
 		mapi = api.PermissionedStorMinerAPI(mapi)
 	}
 
 	readerHandler, readerServerOpt := rpcenc.ReaderParamDecoder()
-	rpcServer := jsonrpc.NewServer(readerServerOpt)
+	rpcServer := jsonrpc.NewServer(jsonrpc.WithServerErrors(api.RPCErrors), readerServerOpt)
 	rpcServer.Register("Filecoin", mapi)
 	rpcServer.AliasMethod("rpc.discover", "Filecoin.Discover")
 
-	m.Handle("/rpc/v0", rpcServer)
-	m.Handle("/rpc/streams/v0/push/{uuid}", readerHandler)
-	m.PathPrefix("/remote").HandlerFunc(a.(*impl.StorageMinerAPI).ServeRemote(permissioned))
+	rootMux := mux.NewRouter()
 
-	// debugging
-	m.Handle("/debug/metrics", metrics.Exporter())
-	m.PathPrefix("/").Handler(http.DefaultServeMux) // pprof
+	// remote storage
+	if _, realImpl := a.(*impl.StorageMinerAPI); realImpl {
+		m := mux.NewRouter()
+		m.PathPrefix("/remote").HandlerFunc(a.(*impl.StorageMinerAPI).ServeRemote(permissioned))
 
-	if !permissioned {
-		return m, nil
+		var hnd http.Handler = m
+		if permissioned {
+			hnd = &auth.Handler{
+				Verify: a.StorageAuthVerify,
+				Next:   m.ServeHTTP,
+			}
+		}
+
+		rootMux.PathPrefix("/remote").Handler(hnd)
 	}
 
-	ah := &auth.Handler{
-		Verify: a.AuthVerify,
-		Next:   m.ServeHTTP,
+	// local APIs
+	{
+		m := mux.NewRouter()
+		m.Handle("/rpc/v0", rpcServer)
+		m.Handle("/rpc/streams/v0/push/{uuid}", readerHandler)
+		// debugging
+		m.Handle("/debug/metrics", metrics.Exporter())
+		m.PathPrefix("/").Handler(http.DefaultServeMux) // pprof
+
+		var hnd http.Handler = m
+		if permissioned {
+			hnd = &auth.Handler{
+				Verify: a.AuthVerify,
+				Next:   m.ServeHTTP,
+			}
+		}
+
+		rootMux.PathPrefix("/").Handler(hnd)
 	}
-	return ah, nil
-}
 
-func handleImport(a *impl.FullNodeAPI) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "PUT" {
-			w.WriteHeader(404)
-			return
-		}
-		if !auth.HasPerm(r.Context(), nil, api.PermWrite) {
-			w.WriteHeader(401)
-			_ = json.NewEncoder(w).Encode(struct{ Error string }{"unauthorized: missing write permission"})
-			return
-		}
-
-		c, err := a.ClientImportLocal(r.Context(), r.Body)
-		if err != nil {
-			w.WriteHeader(500)
-			_ = json.NewEncoder(w).Encode(struct{ Error string }{err.Error()})
-			return
-		}
-		w.WriteHeader(200)
-		err = json.NewEncoder(w).Encode(struct{ Cid cid.Cid }{c})
-		if err != nil {
-			rpclog.Errorf("/rest/v0/import: Writing response failed: %+v", err)
-			return
-		}
-	}
-}
-
-func handleExport(a *impl.FullNodeAPI) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" {
-			w.WriteHeader(404)
-			return
-		}
-		if !auth.HasPerm(r.Context(), nil, api.PermWrite) {
-			w.WriteHeader(401)
-			_ = json.NewEncoder(w).Encode(struct{ Error string }{"unauthorized: missing write permission"})
-			return
-		}
-
-		var eref api.ExportRef
-		if err := json.Unmarshal([]byte(r.FormValue("export")), &eref); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		car := r.FormValue("car") == "true"
-
-		err := a.ClientExportInto(r.Context(), eref, car, client.ExportDest{Writer: w})
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
+	return rootMux, nil
 }
 
 func handleFractionOpt(name string, setter func(int)) http.HandlerFunc {

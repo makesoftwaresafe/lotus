@@ -1,4 +1,3 @@
-//stm: #unit
 package badgerbs
 
 import (
@@ -19,8 +18,6 @@ import (
 )
 
 func TestBadgerBlockstore(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_PUT_001, @SPLITSTORE_BADGER_POOLED_STORAGE_KEY_001
-	//stm: @SPLITSTORE_BADGER_OPEN_001, @SPLITSTORE_BADGER_CLOSE_001
 	(&Suite{
 		NewBlockstore:  newBlockstore(DefaultOptions),
 		OpenBlockstore: openBlockstore(DefaultOptions),
@@ -39,8 +36,6 @@ func TestBadgerBlockstore(t *testing.T) {
 }
 
 func TestStorageKey(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_OPEN_001, @SPLITSTORE_BADGER_CLOSE_001
-	//stm: @SPLITSTORE_BADGER_STORAGE_KEY_001
 	bs, _ := newBlockstore(DefaultOptions)(t)
 	bbs := bs.(*Blockstore)
 	defer bbs.Close() //nolint:errcheck
@@ -145,7 +140,7 @@ func testMove(t *testing.T, optsF func(string) Options) {
 		return nil
 	})
 	g.Go(func() error {
-		return db.CollectGarbage(blockstore.WithFullGC(true))
+		return db.CollectGarbage(ctx, blockstore.WithFullGC(true))
 	})
 
 	err = g.Wait()
@@ -230,7 +225,7 @@ func testMove(t *testing.T, optsF func(string) Options) {
 	checkPath()
 
 	// now do another FullGC to test the double move and following of symlinks
-	if err := db.CollectGarbage(blockstore.WithFullGC(true)); err != nil {
+	if err := db.CollectGarbage(ctx, blockstore.WithFullGC(true)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -254,16 +249,10 @@ func testMove(t *testing.T, optsF func(string) Options) {
 }
 
 func TestMoveNoPrefix(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_OPEN_001, @SPLITSTORE_BADGER_CLOSE_001
-	//stm: @SPLITSTORE_BADGER_PUT_001, @SPLITSTORE_BADGER_POOLED_STORAGE_KEY_001
-	//stm: @SPLITSTORE_BADGER_DELETE_001, @SPLITSTORE_BADGER_COLLECT_GARBAGE_001
 	testMove(t, DefaultOptions)
 }
 
 func TestMoveWithPrefix(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_OPEN_001, @SPLITSTORE_BADGER_CLOSE_001
-	//stm: @SPLITSTORE_BADGER_PUT_001, @SPLITSTORE_BADGER_POOLED_STORAGE_KEY_001
-	//stm: @SPLITSTORE_BADGER_DELETE_001, @SPLITSTORE_BADGER_COLLECT_GARBAGE_001
 	testMove(t, func(path string) Options {
 		opts := DefaultOptions(path)
 		opts.Prefix = "/prefixed/"

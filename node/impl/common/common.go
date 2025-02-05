@@ -2,6 +2,7 @@ package common
 
 import (
 	"context"
+	"time"
 
 	"github.com/gbrlsnchs/jwt/v3"
 	"github.com/google/uuid"
@@ -14,6 +15,7 @@ import (
 	"github.com/filecoin-project/lotus/api"
 	apitypes "github.com/filecoin-project/lotus/api/types"
 	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/journal/alerting"
 	"github.com/filecoin-project/lotus/node/modules/dtypes"
 )
@@ -23,9 +25,13 @@ var session = uuid.New()
 type CommonAPI struct {
 	fx.In
 
+	BuildVersion build.BuildVersion
+
 	Alerting     *alerting.Alerting
 	APISecret    *dtypes.APIAlg
 	ShutdownChan dtypes.ShutdownChan
+
+	Start dtypes.NodeStartTime
 }
 
 type jwtPayload struct {
@@ -60,10 +66,10 @@ func (a *CommonAPI) Version(context.Context) (api.APIVersion, error) {
 	}
 
 	return api.APIVersion{
-		Version:    build.UserVersion(),
+		Version:    string(a.BuildVersion),
 		APIVersion: v,
 
-		BlockDelay: build.BlockDelaySecs,
+		BlockDelay: buildconstants.BlockDelaySecs,
 	}, nil
 }
 
@@ -90,4 +96,8 @@ func (a *CommonAPI) Session(ctx context.Context) (uuid.UUID, error) {
 
 func (a *CommonAPI) Closing(ctx context.Context) (<-chan struct{}, error) {
 	return make(chan struct{}), nil // relies on jsonrpc closing
+}
+
+func (a *CommonAPI) StartTime(context.Context) (time.Time, error) {
+	return time.Time(a.Start), nil
 }

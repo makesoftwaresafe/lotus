@@ -1,28 +1,32 @@
 package paths
 
 import (
+	"os"
 	"sync"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru/v2"
 
 	"github.com/filecoin-project/lotus/storage/sealer/fsutil"
+	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
-var StatTimeout = 5 * time.Second
-var MaxDiskUsageDuration = time.Second
+var (
+	StatTimeout          = 5 * time.Second
+	MaxDiskUsageDuration = time.Second
+)
 
 type cachedLocalStorage struct {
 	base LocalStorage
 
 	statLk  sync.Mutex
-	stats   *lru.Cache // path -> statEntry
-	pathDUs *lru.Cache // path -> *diskUsageEntry
+	stats   *lru.Cache[string, statEntry]
+	pathDUs *lru.Cache[string, *diskUsageEntry]
 }
 
 func newCachedLocalStorage(ls LocalStorage) *cachedLocalStorage {
-	statCache, _ := lru.New(1024)
-	duCache, _ := lru.New(1024)
+	statCache, _ := lru.New[string, statEntry](1024)
+	duCache, _ := lru.New[string, *diskUsageEntry](1024)
 
 	return &cachedLocalStorage{
 		base:    ls,
@@ -47,11 +51,11 @@ type diskUsageResult struct {
 	time  time.Time
 }
 
-func (c *cachedLocalStorage) GetStorage() (StorageConfig, error) {
+func (c *cachedLocalStorage) GetStorage() (storiface.StorageConfig, error) {
 	return c.base.GetStorage()
 }
 
-func (c *cachedLocalStorage) SetStorage(f func(*StorageConfig)) error {
+func (c *cachedLocalStorage) SetStorage(f func(*storiface.StorageConfig)) error {
 	return c.base.SetStorage(f)
 }
 
@@ -59,8 +63,8 @@ func (c *cachedLocalStorage) Stat(path string) (fsutil.FsStat, error) {
 	c.statLk.Lock()
 	defer c.statLk.Unlock()
 
-	if v, ok := c.stats.Get(path); ok && time.Now().Sub(v.(statEntry).time) < StatTimeout {
-		return v.(statEntry).stat, nil
+	if v, ok := c.stats.Get(path); ok && time.Since(v.time) < StatTimeout {
+		return v.stat, nil
 	}
 
 	// if we don't, get the stat
@@ -82,10 +86,10 @@ func (c *cachedLocalStorage) DiskUsage(path string) (int64, error) {
 	var entry *diskUsageEntry
 
 	if v, ok := c.pathDUs.Get(path); ok {
-		entry = v.(*diskUsageEntry)
+		entry = v
 
 		// if we have recent cached entry, use that
-		if time.Now().Sub(entry.last.time) < StatTimeout {
+		if time.Since(entry.last.time) < StatTimeout {
 			return entry.last.usage, nil
 		}
 	} else {
@@ -102,7 +106,9 @@ func (c *cachedLocalStorage) DiskUsage(path string) (int64, error) {
 		go func() {
 			du, err := c.base.DiskUsage(path)
 			if err != nil {
-				log.Errorw("error getting disk usage", "path", path, "error", err)
+				if !os.IsNotExist(err) {
+					log.Errorw("error getting disk usage", "path", path, "error", err)
+				}
 			}
 			resCh <- diskUsageResult{
 				usage: du,
@@ -122,7 +128,7 @@ func (c *cachedLocalStorage) DiskUsage(path string) (int64, error) {
 		log.Warnw("getting usage is slow, falling back to previous usage",
 			"path", path,
 			"fallback", entry.last.usage,
-			"age", time.Now().Sub(entry.last.time))
+			"age", time.Since(entry.last.time))
 	}
 
 	return entry.last.usage, nil

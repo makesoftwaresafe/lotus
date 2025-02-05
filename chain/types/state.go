@@ -15,8 +15,10 @@ const (
 	StateTreeVersion2
 	// StateTreeVersion3 corresponds to actors v4.
 	StateTreeVersion3
-	// StateTreeVersion4 corresponds to actors v5, v6.
+	// StateTreeVersion4 corresponds to actors v5 and above.
 	StateTreeVersion4
+	// StateTreeVersion5 corresponds to actors v10 and above.
+	StateTreeVersion5
 )
 
 type StateRoot struct {
@@ -28,5 +30,4 @@ type StateRoot struct {
 	Info cid.Cid
 }
 
-// TODO: version this.
-type StateInfo0 struct{}
+type StateInfo0 struct{} // TODO: version this.

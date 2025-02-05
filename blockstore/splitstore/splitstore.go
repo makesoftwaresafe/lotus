@@ -11,6 +11,7 @@ import (
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	dstore "github.com/ipfs/go-datastore"
+	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
 	"go.opencensus.io/stats"
 	"go.uber.org/multierr"
@@ -19,7 +20,7 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 
 	bstore "github.com/filecoin-project/lotus/blockstore"
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/chain/actors/policy"
 	"github.com/filecoin-project/lotus/chain/stmgr"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/metrics"
@@ -42,7 +43,15 @@ var (
 	// compactionIndexKey stores the compaction index (serial number)
 	compactionIndexKey = dstore.NewKey("/splitstore/compactionIndex")
 
+	// stores the prune index (serial number)
+	pruneIndexKey = dstore.NewKey("/splitstore/pruneIndex")
+
+	// stores the base epoch of last prune in the metadata store
+	pruneEpochKey = dstore.NewKey("/splitstore/pruneEpoch")
+
 	log = logging.Logger("splitstore")
+
+	errClosing = errors.New("splitstore is closing")
 
 	// set this to true if you are debugging the splitstore to enable debug logging
 	enableDebugLog = false
@@ -50,7 +59,17 @@ var (
 	enableDebugLogWriteTraces = false
 
 	// upgradeBoundary is the boundary before and after an upgrade where we suppress compaction
-	upgradeBoundary = build.Finality
+	upgradeBoundary = policy.ChainFinality
+)
+
+type CompactType int
+
+const (
+	none CompactType = iota
+	warmup
+	hot
+	cold
+	check
 )
 
 func init() {
@@ -79,6 +98,10 @@ type Config struct {
 	// and directly purges cold blocks.
 	DiscardColdBlocks bool
 
+	// UniversalColdBlocks indicates whether all blocks being garbage collected and purged
+	// from the hotstore should be written to the cold store
+	UniversalColdBlocks bool
+
 	// HotstoreMessageRetention indicates the hotstore retention policy for messages.
 	// It has the following semantics:
 	// - a value of 0 will only retain messages within the compaction boundary (4 finalities)
@@ -92,6 +115,23 @@ type Config struct {
 	// A positive value is the number of compactions before a full GC is performed;
 	// a value of 1 will perform full GC in every compaction.
 	HotStoreFullGCFrequency uint64
+
+	// HotstoreMaxSpaceTarget suggests the max allowed space the hotstore can take.
+	// This is not a hard limit, it is possible for the hotstore to exceed the target
+	// for example if state grows massively between compactions. The splitstore
+	// will make a best effort to avoid overflowing the target and in practice should
+	// never overflow.  This field is used when doing GC at the end of a compaction to
+	// adaptively choose moving GC
+	HotstoreMaxSpaceTarget uint64
+
+	// Moving GC will be triggered when total moving size exceeds
+	// HotstoreMaxSpaceTarget - HotstoreMaxSpaceThreshold
+	HotstoreMaxSpaceThreshold uint64
+
+	// Safety buffer to prevent moving GC from overflowing disk.
+	// Moving GC will not occur when total moving size exceeds
+	// HotstoreMaxSpaceTarget - HotstoreMaxSpaceSafetyBuffer
+	HotstoreMaxSpaceSafetyBuffer uint64
 }
 
 // ChainAccessor allows the Splitstore to access the chain. It will most likely
@@ -116,15 +156,17 @@ type hotstore interface {
 }
 
 type SplitStore struct {
-	compacting int32 // compaction/prune/warmup in progress
-	closing    int32 // the splitstore is closing
+	compacting  int32       // flag for when compaction is in progress
+	compactType CompactType // compaction type, protected by compacting atomic, only meaningful when compacting == 1
+	closing     int32       // the splitstore is closing
 
 	cfg  *Config
 	path string
 
 	mx          sync.Mutex
-	warmupEpoch abi.ChainEpoch // protected by mx
+	warmupEpoch atomic.Int64
 	baseEpoch   abi.ChainEpoch // protected by compaction lock
+	pruneEpoch  abi.ChainEpoch // protected by compaction lock
 
 	headChangeMx sync.Mutex
 
@@ -139,9 +181,15 @@ type SplitStore struct {
 	markSetSize int64
 
 	compactionIndex int64
+	pruneIndex      int64
 
 	ctx    context.Context
 	cancel func()
+
+	outOfSync         int32 // for fast checking
+	chainSyncMx       sync.Mutex
+	chainSyncCond     sync.Cond
+	chainSyncFinished bool // protected by chainSyncMx
 
 	debug *debugLog
 
@@ -169,6 +217,17 @@ type SplitStore struct {
 
 	// registered protectors
 	protectors []func(func(cid.Cid) error) error
+
+	// dag sizes measured during latest compaction
+	// logged and used for GC strategy
+
+	// protected by compaction lock
+	szWalk          int64
+	szProtectedTxns int64
+	szKeys          int64 // approximate, not counting keys protected when entering critical section
+
+	// protected by txnLk
+	szMarkedLiveRefs int64
 }
 
 var _ bstore.Blockstore = (*SplitStore)(nil)
@@ -206,7 +265,12 @@ func Open(path string, ds dstore.Datastore, hot, cold bstore.Blockstore, cfg *Co
 
 	ss.txnViewsCond.L = &ss.txnViewsMx
 	ss.txnSyncCond.L = &ss.txnSyncMx
-	ss.ctx, ss.cancel = context.WithCancel(context.Background())
+	ss.chainSyncCond.L = &ss.chainSyncMx
+
+	baseCtx := context.Background()
+	ctx := metrics.AddNetworkTag(baseCtx)
+
+	ss.ctx, ss.cancel = context.WithCancel(ctx)
 
 	ss.reifyCond.L = &ss.reifyMx
 	ss.reifyPend = make(map[cid.Cid]struct{})
@@ -222,15 +286,23 @@ func Open(path string, ds dstore.Datastore, hot, cold bstore.Blockstore, cfg *Co
 	if ss.checkpointExists() {
 		log.Info("found compaction checkpoint; resuming compaction")
 		if err := ss.completeCompaction(); err != nil {
-			markSetEnv.Close() //nolint:errcheck
+			_ = markSetEnv.Close()
 			return nil, xerrors.Errorf("error resuming compaction: %w", err)
+		}
+	}
+	if ss.pruneCheckpointExists() {
+		log.Info("found prune checkpoint; resuming prune")
+		if err := ss.completePrune(); err != nil {
+			_ = markSetEnv.Close()
+			return nil, xerrors.Errorf("error resuming prune: %w", err)
 		}
 	}
 
 	return ss, nil
 }
 
-// Blockstore interface
+// Blockstore interface --------------------------------------------------------
+
 func (s *SplitStore) DeleteBlock(_ context.Context, _ cid.Cid) error {
 	// afaict we don't seem to be using this method, so it's not implemented
 	return errors.New("DeleteBlock not implemented on SplitStore; don't do this Luke!") //nolint
@@ -259,8 +331,14 @@ func (s *SplitStore) Has(ctx context.Context, cid cid.Cid) (bool, error) {
 		if has {
 			return s.has(cid)
 		}
-
-		return s.cold.Has(ctx, cid)
+		switch s.compactType {
+		case hot:
+			return s.cold.Has(ctx, cid)
+		case cold:
+			return s.hot.Has(ctx, cid)
+		default:
+			return false, xerrors.Errorf("invalid compaction type %d, only hot and cold allowed for critical section", s.compactType)
+		}
 	}
 
 	has, err := s.hot.Has(ctx, cid)
@@ -275,8 +353,11 @@ func (s *SplitStore) Has(ctx context.Context, cid cid.Cid) (bool, error) {
 	}
 
 	has, err = s.cold.Has(ctx, cid)
-	if has && bstore.IsHotView(ctx) {
-		s.reifyColdObject(cid)
+	if has {
+		s.trackTxnRef(cid)
+		if bstore.IsHotView(ctx) {
+			s.reifyColdObject(cid)
+		}
 	}
 
 	return has, err
@@ -306,24 +387,31 @@ func (s *SplitStore) Get(ctx context.Context, cid cid.Cid) (blocks.Block, error)
 		if has {
 			return s.get(cid)
 		}
-
-		return s.cold.Get(ctx, cid)
+		switch s.compactType {
+		case hot:
+			return s.cold.Get(ctx, cid)
+		case cold:
+			return s.hot.Get(ctx, cid)
+		default:
+			return nil, xerrors.Errorf("invalid compaction type %d, only hot and cold allowed for critical section", s.compactType)
+		}
 	}
 
 	blk, err := s.hot.Get(ctx, cid)
 
-	switch err {
-	case nil:
+	switch {
+	case err == nil:
 		s.trackTxnRef(cid)
 		return blk, nil
 
-	case bstore.ErrNotFound:
+	case ipld.IsNotFound(err):
 		if s.isWarm() {
 			s.debug.LogReadMiss(cid)
 		}
 
 		blk, err = s.cold.Get(ctx, cid)
 		if err == nil {
+			s.trackTxnRef(cid)
 			if bstore.IsHotView(ctx) {
 				s.reifyColdObject(cid)
 			}
@@ -360,24 +448,31 @@ func (s *SplitStore) GetSize(ctx context.Context, cid cid.Cid) (int, error) {
 		if has {
 			return s.getSize(cid)
 		}
-
-		return s.cold.GetSize(ctx, cid)
+		switch s.compactType {
+		case hot:
+			return s.cold.GetSize(ctx, cid)
+		case cold:
+			return s.hot.GetSize(ctx, cid)
+		default:
+			return 0, xerrors.Errorf("invalid compaction type %d, only hot and cold allowed for critical section", s.compactType)
+		}
 	}
 
 	size, err := s.hot.GetSize(ctx, cid)
 
-	switch err {
-	case nil:
+	switch {
+	case err == nil:
 		s.trackTxnRef(cid)
 		return size, nil
 
-	case bstore.ErrNotFound:
+	case ipld.IsNotFound(err):
 		if s.isWarm() {
 			s.debug.LogReadMiss(cid)
 		}
 
 		size, err = s.cold.GetSize(ctx, cid)
 		if err == nil {
+			s.trackTxnRef(cid)
 			if bstore.IsHotView(ctx) {
 				s.reifyColdObject(cid)
 			}
@@ -389,6 +484,23 @@ func (s *SplitStore) GetSize(ctx context.Context, cid cid.Cid) (int, error) {
 	default:
 		return 0, err
 	}
+}
+
+func (s *SplitStore) Flush(ctx context.Context) error {
+	s.txnLk.RLock()
+	defer s.txnLk.RUnlock()
+
+	if err := s.cold.Flush(ctx); err != nil {
+		return err
+	}
+	if err := s.hot.Flush(ctx); err != nil {
+		return err
+	}
+	if err := s.ds.Sync(ctx, dstore.Key{}); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (s *SplitStore) Put(ctx context.Context, blk blocks.Block) error {
@@ -407,12 +519,12 @@ func (s *SplitStore) Put(ctx context.Context, blk blocks.Block) error {
 	s.debug.LogWrite(blk)
 
 	// critical section
-	if s.txnMarkSet != nil {
+	if s.txnMarkSet != nil && s.compactType == hot { // puts only touch hot store
 		s.markLiveRefs([]cid.Cid{blk.Cid()})
 		return nil
 	}
-
 	s.trackTxnRef(blk.Cid())
+
 	return nil
 }
 
@@ -458,12 +570,12 @@ func (s *SplitStore) PutMany(ctx context.Context, blks []blocks.Block) error {
 	s.debug.LogWriteMany(blks)
 
 	// critical section
-	if s.txnMarkSet != nil {
+	if s.txnMarkSet != nil && s.compactType == hot { // puts only touch hot store
 		s.markLiveRefs(batch)
 		return nil
 	}
-
 	s.trackTxnRefMany(batch)
+
 	return nil
 }
 
@@ -535,8 +647,14 @@ func (s *SplitStore) View(ctx context.Context, cid cid.Cid, cb func([]byte) erro
 		if has {
 			return s.view(cid, cb)
 		}
-
-		return s.cold.View(ctx, cid, cb)
+		switch s.compactType {
+		case hot:
+			return s.cold.View(ctx, cid, cb)
+		case cold:
+			return s.hot.View(ctx, cid, cb)
+		default:
+			return xerrors.Errorf("invalid compaction type %d, only hot and cold allowed for critical section", s.compactType)
+		}
 	}
 
 	// views are (optimistically) protected two-fold:
@@ -551,8 +669,7 @@ func (s *SplitStore) View(ctx context.Context, cid cid.Cid, cb func([]byte) erro
 	defer s.viewDone()
 
 	err := s.hot.View(ctx, cid, cb)
-	switch err {
-	case bstore.ErrNotFound:
+	if ipld.IsNotFound(err) {
 		if s.isWarm() {
 			s.debug.LogReadMiss(cid)
 		}
@@ -566,19 +683,15 @@ func (s *SplitStore) View(ctx context.Context, cid cid.Cid, cb func([]byte) erro
 			stats.Record(s.ctx, metrics.SplitstoreMiss.M(1))
 		}
 		return err
-
-	default:
-		return err
 	}
+	return err
 }
 
 func (s *SplitStore) isWarm() bool {
-	s.mx.Lock()
-	defer s.mx.Unlock()
-	return s.warmupEpoch > 0
+	return s.warmupEpoch.Load() > 0
 }
 
-// State tracking
+// Start state tracking
 func (s *SplitStore) Start(chain ChainAccessor, us stmgr.UpgradeSchedule) error {
 	s.chain = chain
 	curTs := chain.GetHeaviestTipSet()
@@ -625,11 +738,28 @@ func (s *SplitStore) Start(chain ChainAccessor, us stmgr.UpgradeSchedule) error 
 		return xerrors.Errorf("error loading base epoch: %w", err)
 	}
 
+	// load prune epoch from metadata ds
+	bs, err = s.ds.Get(s.ctx, pruneEpochKey)
+	switch err {
+	case nil:
+		s.pruneEpoch = bytesToEpoch(bs)
+	case dstore.ErrNotFound:
+		if curTs == nil {
+			//this can happen in some tests
+			break
+		}
+		if err := s.setPruneEpoch(curTs.Height()); err != nil {
+			return xerrors.Errorf("error saving prune epoch: %w", err)
+		}
+	default:
+		return xerrors.Errorf("error loading prune epoch: %w", err)
+	}
+
 	// load warmup epoch from metadata ds
 	bs, err = s.ds.Get(s.ctx, warmupEpochKey)
 	switch err {
 	case nil:
-		s.warmupEpoch = bytesToEpoch(bs)
+		s.warmupEpoch.Store(bytesToInt64(bs))
 
 	case dstore.ErrNotFound:
 		warmup = true
@@ -663,7 +793,7 @@ func (s *SplitStore) Start(chain ChainAccessor, us stmgr.UpgradeSchedule) error 
 		return xerrors.Errorf("error loading compaction index: %w", err)
 	}
 
-	log.Infow("starting splitstore", "baseEpoch", s.baseEpoch, "warmupEpoch", s.warmupEpoch)
+	log.Infow("starting splitstore", "baseEpoch", s.baseEpoch, "warmupEpoch", s.warmupEpoch.Load())
 
 	if warmup {
 		err = s.warmup(curTs)
@@ -700,6 +830,11 @@ func (s *SplitStore) Close() error {
 		s.txnSyncCond.Broadcast()
 		s.txnSyncMx.Unlock()
 
+		s.chainSyncMx.Lock()
+		s.chainSyncFinished = true
+		s.chainSyncCond.Broadcast()
+		s.chainSyncMx.Unlock()
+
 		log.Warn("close with ongoing compaction in progress; waiting for it to finish...")
 		for atomic.LoadInt32(&s.compacting) == 1 {
 			time.Sleep(time.Second)
@@ -723,4 +858,9 @@ func (s *SplitStore) checkClosing() error {
 func (s *SplitStore) setBaseEpoch(epoch abi.ChainEpoch) error {
 	s.baseEpoch = epoch
 	return s.ds.Put(s.ctx, baseEpochKey, epochToBytes(epoch))
+}
+
+func (s *SplitStore) setPruneEpoch(epoch abi.ChainEpoch) error {
+	s.pruneEpoch = epoch
+	return s.ds.Put(s.ctx, pruneEpochKey, epochToBytes(epoch))
 }

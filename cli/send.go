@@ -1,20 +1,25 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/urfave/cli/v2"
+	cbg "github.com/whyrusleeping/cbor-gen"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+	builtintypes "github.com/filecoin-project/go-state-types/builtin"
 
 	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/types"
+	"github.com/filecoin-project/lotus/chain/types/ethtypes"
 )
 
-var sendCmd = &cli.Command{
+var SendCmd = &cli.Command{
 	Name:      "send",
 	Usage:     "Send funds between accounts",
 	ArgsUsage: "[targetAddress] [amount]",
@@ -22,6 +27,10 @@ var sendCmd = &cli.Command{
 		&cli.StringFlag{
 			Name:  "from",
 			Usage: "optionally specify the account to send funds from",
+		},
+		&cli.StringFlag{
+			Name:  "from-eth-addr",
+			Usage: "optionally specify the eth addr to send funds from",
 		},
 		&cli.StringFlag{
 			Name:  "gas-premium",
@@ -66,8 +75,8 @@ var sendCmd = &cli.Command{
 			fmt.Println("'force' flag is deprecated, use global flag 'force-send'")
 		}
 
-		if cctx.Args().Len() != 2 {
-			return ShowHelp(cctx, fmt.Errorf("'send' expects two arguments, target and amount"))
+		if cctx.NArg() != 2 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		srv, err := GetFullNodeServices(cctx)
@@ -79,9 +88,24 @@ var sendCmd = &cli.Command{
 		ctx := ReqContext(cctx)
 		var params SendParams
 
+		is0xRecipient := false
 		params.To, err = address.NewFromString(cctx.Args().Get(0))
 		if err != nil {
-			return ShowHelp(cctx, fmt.Errorf("failed to parse target address: %w", err))
+			// could be an ETH address
+			ea, err := ethtypes.ParseEthAddress(cctx.Args().Get(0))
+			if err != nil {
+				return ShowHelp(cctx, fmt.Errorf("failed to parse target address; address must be a valid FIL address or an ETH address: %w", err))
+			}
+			is0xRecipient = true
+			// this will be either "f410f..." or "f0..."
+			params.To, err = ea.ToFilecoinAddress()
+			if err != nil {
+				return ShowHelp(cctx, fmt.Errorf("failed to convert ETH address to FIL address: %w", err))
+			}
+			// ideally, this should never happen
+			if !(params.To.Protocol() == address.ID || params.To.Protocol() == address.Delegated) {
+				return ShowHelp(cctx, fmt.Errorf("ETH addresses can only map to a FIL addresses starting with f410f or f0"))
+			}
 		}
 
 		val, err := types.ParseFIL(cctx.Args().Get(1))
@@ -97,7 +121,74 @@ var sendCmd = &cli.Command{
 			}
 
 			params.From = addr
+		} else if from := cctx.String("from-eth-addr"); from != "" {
+			eaddr, err := ethtypes.ParseEthAddress(from)
+			if err != nil {
+				return err
+			}
+			faddr, err := eaddr.ToFilecoinAddress()
+			if err != nil {
+				fmt.Println("error on conversion to faddr")
+				return err
+			}
+			fmt.Println("f4 addr: ", faddr)
+			params.From = faddr
+		} else {
+			defaddr, err := srv.FullNodeAPI().WalletDefaultAddress(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to get default address: %w", err)
+			}
+			params.From = defaddr
 		}
+
+		if cctx.IsSet("params-hex") {
+			decparams, err := hex.DecodeString(cctx.String("params-hex"))
+			if err != nil {
+				return fmt.Errorf("failed to decode hex params: %w", err)
+			}
+			params.Params = decparams
+		}
+
+		if ethtypes.IsEthAddress(params.From) || is0xRecipient {
+			// Method numbers don't make sense from eth accounts.
+			if cctx.IsSet("method") {
+				return xerrors.Errorf("messages from f410f addresses may not specify a method number")
+			}
+
+			// Now, figure out the correct method number from the recipient.
+			if params.To == builtintypes.EthereumAddressManagerActorAddr {
+				params.Method = builtintypes.MethodsEAM.CreateExternal
+			} else {
+				params.Method = builtintypes.MethodsEVM.InvokeContract
+			}
+
+			if cctx.IsSet("params-json") {
+				return xerrors.Errorf("may not call with json parameters from an eth account")
+			}
+
+			// And format the parameters, if present.
+			if len(params.Params) > 0 {
+				var buf bytes.Buffer
+				if err := cbg.WriteByteArray(&buf, params.Params); err != nil {
+					return xerrors.Errorf("failed to marshal EVM parameters")
+				}
+				params.Params = buf.Bytes()
+			}
+
+			// We can only send to an f410f or f0 address.
+			if !(params.To.Protocol() == address.ID || params.To.Protocol() == address.Delegated) {
+				api := srv.FullNodeAPI()
+				// Resolve id addr if possible.
+				params.To, err = api.StateLookupID(ctx, params.To, types.EmptyTSK)
+				if err != nil {
+					return xerrors.Errorf("addresses starting with f410f can only send to other addresses starting with f410f, or id addresses. could not find id address for %s", params.To.String())
+				}
+			}
+		} else {
+			params.Method = abi.MethodNum(cctx.Uint64("method"))
+		}
+
+		_, _ = fmt.Fprintf(cctx.App.Writer, "Sending message from: %s\nSending message to: %s\nUsing Method: %d\n", params.From.String(), params.To.String(), params.Method)
 
 		if cctx.IsSet("gas-premium") {
 			gp, err := types.BigFromString(cctx.String("gas-premium"))
@@ -120,22 +211,13 @@ var sendCmd = &cli.Command{
 			params.GasLimit = &limit
 		}
 
-		params.Method = abi.MethodNum(cctx.Uint64("method"))
-
 		if cctx.IsSet("params-json") {
-			decparams, err := srv.DecodeTypedParamsFromJSON(ctx, params.To, params.Method, cctx.String("params-json"))
-			if err != nil {
-				return fmt.Errorf("failed to decode json params: %w", err)
-			}
-			params.Params = decparams
-		}
-		if cctx.IsSet("params-hex") {
 			if params.Params != nil {
 				return fmt.Errorf("can only specify one of 'params-json' and 'params-hex'")
 			}
-			decparams, err := hex.DecodeString(cctx.String("params-hex"))
+			decparams, err := srv.DecodeTypedParamsFromJSON(ctx, params.To, params.Method, cctx.String("params-json"))
 			if err != nil {
-				return fmt.Errorf("failed to decode hex params: %w", err)
+				return fmt.Errorf("failed to decode json params: %w", err)
 			}
 			params.Params = decparams
 		}
@@ -152,10 +234,13 @@ var sendCmd = &cli.Command{
 
 		sm, err := InteractiveSend(ctx, cctx, srv, proto)
 		if err != nil {
+			if strings.Contains(err.Error(), "no current EF") {
+				return xerrors.Errorf("transaction rejected on ledger: %w", err)
+			}
 			return err
 		}
 
-		fmt.Fprintf(cctx.App.Writer, "%s\n", sm.Cid())
+		_, _ = fmt.Fprintf(cctx.App.Writer, "%s\n", sm.Cid())
 		return nil
 	},
 }

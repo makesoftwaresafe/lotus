@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/urfave/cli/v2"
-	ledgerfil "github.com/whyrusleeping/ledger-filecoin-go"
+	ledgerfil "github.com/zondax/ledger-filecoin-go"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/big"
@@ -300,7 +300,7 @@ var ledgerNewAddressesCmd = &cli.Command{
 		ctx := lcli.ReqContext(cctx)
 
 		if cctx.NArg() != 1 {
-			return fmt.Errorf("must pass account index")
+			return lcli.IncorrectNumArgs(cctx)
 		}
 
 		index, err := strconv.ParseUint(cctx.Args().First(), 10, 32)

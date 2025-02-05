@@ -3,6 +3,7 @@ package sealer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"reflect"
@@ -28,11 +29,12 @@ import (
 	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
-var pathTypes = []storiface.SectorFileType{storiface.FTUnsealed, storiface.FTSealed, storiface.FTCache, storiface.FTUpdate, storiface.FTUpdateCache}
-
 type WorkerConfig struct {
 	TaskTypes []sealtasks.TaskType
 	NoSwap    bool
+
+	// os.Hostname if not set
+	Name string
 
 	// IgnoreResourceFiltering enables task distribution to happen on this
 	// worker regardless of its currently available resources. Used in testing
@@ -44,7 +46,8 @@ type WorkerConfig struct {
 }
 
 // used do provide custom proofs impl (mostly used in testing)
-type ExecutorFunc func() (storiface.Storage, error)
+
+type ExecutorFunc func(w *LocalWorker) (storiface.Storage, error)
 type EnvFunc func(string) (string, bool)
 
 type LocalWorker struct {
@@ -55,6 +58,8 @@ type LocalWorker struct {
 	executor   ExecutorFunc
 	noSwap     bool
 	envLookup  EnvFunc
+
+	name string
 
 	// see equivalent field on WorkerConfig.
 	ignoreResources bool
@@ -72,7 +77,7 @@ type LocalWorker struct {
 	closing     chan struct{}
 }
 
-func newLocalWorker(executor ExecutorFunc, wcfg WorkerConfig, envLookup EnvFunc, store paths.Store, local *paths.Local, sindex paths.SectorIndex, ret storiface.WorkerReturn, cst *statestore.StateStore) *LocalWorker {
+func NewLocalWorkerWithExecutor(executor ExecutorFunc, wcfg WorkerConfig, envLookup EnvFunc, store paths.Store, local *paths.Local, sindex paths.SectorIndex, ret storiface.WorkerReturn, cst *statestore.StateStore) *LocalWorker {
 	acceptTasks := map[sealtasks.TaskType]struct{}{}
 	for _, taskType := range wcfg.TaskTypes {
 		acceptTasks[taskType] = struct{}{}
@@ -83,6 +88,7 @@ func newLocalWorker(executor ExecutorFunc, wcfg WorkerConfig, envLookup EnvFunc,
 		localStore: local,
 		sindex:     sindex,
 		ret:        ret,
+		name:       wcfg.Name,
 
 		ct: &workerCallTracker{
 			st: cst,
@@ -97,12 +103,20 @@ func newLocalWorker(executor ExecutorFunc, wcfg WorkerConfig, envLookup EnvFunc,
 		closing:              make(chan struct{}),
 	}
 
+	if w.name == "" {
+		var err error
+		w.name, err = os.Hostname()
+		if err != nil {
+			panic(err)
+		}
+	}
+
 	if wcfg.MaxParallelChallengeReads > 0 {
 		w.challengeThrottle = make(chan struct{}, wcfg.MaxParallelChallengeReads)
 	}
 
 	if w.executor == nil {
-		w.executor = w.ffiExec
+		w.executor = FFIExec()
 	}
 
 	unfinished, err := w.ct.unfinished()
@@ -113,13 +127,7 @@ func newLocalWorker(executor ExecutorFunc, wcfg WorkerConfig, envLookup EnvFunc,
 
 	go func() {
 		for _, call := range unfinished {
-			hostname, osErr := os.Hostname()
-			if osErr != nil {
-				log.Errorf("get hostname err: %+v", err)
-				hostname = ""
-			}
-
-			err := storiface.Err(storiface.ErrTempWorkerRestart, xerrors.Errorf("worker [Hostname: %s] restarted", hostname))
+			err := storiface.Err(storiface.ErrTempWorkerRestart, xerrors.Errorf("worker [name: %s] restarted", w.name))
 
 			// TODO: Handle restarting PC1 once support is merged
 
@@ -135,7 +143,7 @@ func newLocalWorker(executor ExecutorFunc, wcfg WorkerConfig, envLookup EnvFunc,
 }
 
 func NewLocalWorker(wcfg WorkerConfig, store paths.Store, local *paths.Local, sindex paths.SectorIndex, ret storiface.WorkerReturn, cst *statestore.StateStore) *LocalWorker {
-	return newLocalWorker(nil, wcfg, os.LookupEnv, store, local, sindex, ret, cst)
+	return NewLocalWorkerWithExecutor(nil, wcfg, os.LookupEnv, store, local, sindex, ret, cst)
 }
 
 type localWorkerPathProvider struct {
@@ -144,22 +152,22 @@ type localWorkerPathProvider struct {
 }
 
 func (l *localWorkerPathProvider) AcquireSector(ctx context.Context, sector storiface.SectorRef, existing storiface.SectorFileType, allocate storiface.SectorFileType, sealing storiface.PathType) (storiface.SectorPaths, func(), error) {
-	paths, storageIDs, err := l.w.storage.AcquireSector(ctx, sector, existing, allocate, sealing, l.op)
+	spaths, storageIDs, err := l.w.storage.AcquireSector(ctx, sector, existing, allocate, sealing, l.op)
 	if err != nil {
 		return storiface.SectorPaths{}, nil, err
 	}
 
-	releaseStorage, err := l.w.localStore.Reserve(ctx, sector, allocate, storageIDs, storiface.FSOverheadSeal)
+	releaseStorage, err := l.w.localStore.Reserve(ctx, sector, allocate, storageIDs, storiface.FSOverheadSeal, paths.MinFreeStoragePercentage)
 	if err != nil {
 		return storiface.SectorPaths{}, nil, xerrors.Errorf("reserving storage space: %w", err)
 	}
 
-	log.Debugf("acquired sector %d (e:%d; a:%d): %v", sector, existing, allocate, paths)
+	log.Debugf("acquired sector %d (e:%d; a:%d): %v", sector, existing, allocate, spaths)
 
-	return paths, func() {
+	return spaths, func() {
 		releaseStorage()
 
-		for _, fileType := range pathTypes {
+		for _, fileType := range storiface.PathTypes {
 			if fileType&allocate == 0 {
 				continue
 			}
@@ -172,8 +180,14 @@ func (l *localWorkerPathProvider) AcquireSector(ctx context.Context, sector stor
 	}, nil
 }
 
-func (l *LocalWorker) ffiExec() (storiface.Storage, error) {
-	return ffiwrapper.New(&localWorkerPathProvider{w: l})
+func (l *localWorkerPathProvider) AcquireSectorCopy(ctx context.Context, id storiface.SectorRef, existing storiface.SectorFileType, allocate storiface.SectorFileType, ptype storiface.PathType) (storiface.SectorPaths, func(), error) {
+	return (&localWorkerPathProvider{w: l.w, op: storiface.AcquireCopy}).AcquireSector(ctx, id, existing, allocate, ptype)
+}
+
+func FFIExec(opts ...ffiwrapper.FFIWrapperOpt) func(l *LocalWorker) (storiface.Storage, error) {
+	return func(l *LocalWorker) (storiface.Storage, error) {
+		return ffiwrapper.New(&localWorkerPathProvider{w: l}, opts...)
+	}
 }
 
 type ReturnType string
@@ -194,6 +208,7 @@ const (
 	ReleaseUnsealed       ReturnType = "ReleaseUnsealed"
 	MoveStorage           ReturnType = "MoveStorage"
 	UnsealPiece           ReturnType = "UnsealPiece"
+	DownloadSector        ReturnType = "DownloadSector"
 	Fetch                 ReturnType = "Fetch"
 )
 
@@ -247,6 +262,7 @@ var returnFunc = map[ReturnType]func(context.Context, storiface.CallID, storifac
 	FinalizeReplicaUpdate: rfunc(storiface.WorkerReturn.ReturnFinalizeReplicaUpdate),
 	MoveStorage:           rfunc(storiface.WorkerReturn.ReturnMoveStorage),
 	UnsealPiece:           rfunc(storiface.WorkerReturn.ReturnUnsealPiece),
+	DownloadSector:        rfunc(storiface.WorkerReturn.ReturnDownloadSector),
 	Fetch:                 rfunc(storiface.WorkerReturn.ReturnFetch),
 }
 
@@ -283,12 +299,7 @@ func (l *LocalWorker) asyncCall(ctx context.Context, sector storiface.SectorRef,
 		}
 
 		if err != nil {
-			hostname, osErr := os.Hostname()
-			if osErr != nil {
-				log.Errorf("get hostname err: %+v", err)
-			}
-
-			err = xerrors.Errorf("%w [Hostname: %s]", err, hostname)
+			err = xerrors.Errorf("%w [name: %s]", err, l.name)
 		}
 
 		if doReturn(ctx, rt, ci, l.ret, res, toCallError(err)) {
@@ -302,7 +313,7 @@ func (l *LocalWorker) asyncCall(ctx context.Context, sector storiface.SectorRef,
 
 func toCallError(err error) *storiface.CallError {
 	var serr *storiface.CallError
-	if err != nil && !xerrors.As(err, &serr) {
+	if err != nil && !errors.As(err, &serr) {
 		serr = storiface.Err(storiface.ErrUnknown, err)
 	}
 
@@ -334,7 +345,7 @@ func doReturn(ctx context.Context, rt ReturnType, ci storiface.CallID, ret stori
 }
 
 func (l *LocalWorker) NewSector(ctx context.Context, sector storiface.SectorRef) error {
-	sb, err := l.executor()
+	sb, err := l.executor(l)
 	if err != nil {
 		return err
 	}
@@ -343,7 +354,7 @@ func (l *LocalWorker) NewSector(ctx context.Context, sector storiface.SectorRef)
 }
 
 func (l *LocalWorker) DataCid(ctx context.Context, pieceSize abi.UnpaddedPieceSize, pieceData storiface.Data) (storiface.CallID, error) {
-	sb, err := l.executor()
+	sb, err := l.executor(l)
 	if err != nil {
 		return storiface.UndefCall, err
 	}
@@ -354,7 +365,7 @@ func (l *LocalWorker) DataCid(ctx context.Context, pieceSize abi.UnpaddedPieceSi
 }
 
 func (l *LocalWorker) AddPiece(ctx context.Context, sector storiface.SectorRef, epcs []abi.UnpaddedPieceSize, sz abi.UnpaddedPieceSize, r io.Reader) (storiface.CallID, error) {
-	sb, err := l.executor()
+	sb, err := l.executor(l)
 	if err != nil {
 		return storiface.UndefCall, err
 	}
@@ -389,7 +400,7 @@ func (l *LocalWorker) SealPreCommit1(ctx context.Context, sector storiface.Secto
 			}
 		}
 
-		sb, err := l.executor()
+		sb, err := l.executor(l)
 		if err != nil {
 			return nil, err
 		}
@@ -399,7 +410,7 @@ func (l *LocalWorker) SealPreCommit1(ctx context.Context, sector storiface.Secto
 }
 
 func (l *LocalWorker) SealPreCommit2(ctx context.Context, sector storiface.SectorRef, phase1Out storiface.PreCommit1Out) (storiface.CallID, error) {
-	sb, err := l.executor()
+	sb, err := l.executor(l)
 	if err != nil {
 		return storiface.UndefCall, err
 	}
@@ -410,7 +421,7 @@ func (l *LocalWorker) SealPreCommit2(ctx context.Context, sector storiface.Secto
 }
 
 func (l *LocalWorker) SealCommit1(ctx context.Context, sector storiface.SectorRef, ticket abi.SealRandomness, seed abi.InteractiveSealRandomness, pieces []abi.PieceInfo, cids storiface.SectorCids) (storiface.CallID, error) {
-	sb, err := l.executor()
+	sb, err := l.executor(l)
 	if err != nil {
 		return storiface.UndefCall, err
 	}
@@ -421,7 +432,7 @@ func (l *LocalWorker) SealCommit1(ctx context.Context, sector storiface.SectorRe
 }
 
 func (l *LocalWorker) SealCommit2(ctx context.Context, sector storiface.SectorRef, phase1Out storiface.Commit1Out) (storiface.CallID, error) {
-	sb, err := l.executor()
+	sb, err := l.executor(l)
 	if err != nil {
 		return storiface.UndefCall, err
 	}
@@ -432,7 +443,7 @@ func (l *LocalWorker) SealCommit2(ctx context.Context, sector storiface.SectorRe
 }
 
 func (l *LocalWorker) ReplicaUpdate(ctx context.Context, sector storiface.SectorRef, pieces []abi.PieceInfo) (storiface.CallID, error) {
-	sb, err := l.executor()
+	sb, err := l.executor(l)
 	if err != nil {
 		return storiface.UndefCall, err
 	}
@@ -444,7 +455,7 @@ func (l *LocalWorker) ReplicaUpdate(ctx context.Context, sector storiface.Sector
 }
 
 func (l *LocalWorker) ProveReplicaUpdate1(ctx context.Context, sector storiface.SectorRef, sectorKey, newSealed, newUnsealed cid.Cid) (storiface.CallID, error) {
-	sb, err := l.executor()
+	sb, err := l.executor(l)
 	if err != nil {
 		return storiface.UndefCall, err
 	}
@@ -455,7 +466,7 @@ func (l *LocalWorker) ProveReplicaUpdate1(ctx context.Context, sector storiface.
 }
 
 func (l *LocalWorker) ProveReplicaUpdate2(ctx context.Context, sector storiface.SectorRef, sectorKey, newSealed, newUnsealed cid.Cid, vanillaProofs storiface.ReplicaVanillaProofs) (storiface.CallID, error) {
-	sb, err := l.executor()
+	sb, err := l.executor(l)
 	if err != nil {
 		return storiface.UndefCall, err
 	}
@@ -466,7 +477,7 @@ func (l *LocalWorker) ProveReplicaUpdate2(ctx context.Context, sector storiface.
 }
 
 func (l *LocalWorker) GenerateSectorKeyFromData(ctx context.Context, sector storiface.SectorRef, commD cid.Cid) (storiface.CallID, error) {
-	sb, err := l.executor()
+	sb, err := l.executor(l)
 	if err != nil {
 		return storiface.UndefCall, err
 	}
@@ -476,35 +487,36 @@ func (l *LocalWorker) GenerateSectorKeyFromData(ctx context.Context, sector stor
 	})
 }
 
-func (l *LocalWorker) FinalizeSector(ctx context.Context, sector storiface.SectorRef, keepUnsealed []storiface.Range) (storiface.CallID, error) {
-	sb, err := l.executor()
+func (l *LocalWorker) FinalizeSector(ctx context.Context, sector storiface.SectorRef) (storiface.CallID, error) {
+	sb, err := l.executor(l)
 	if err != nil {
 		return storiface.UndefCall, err
 	}
 
 	return l.asyncCall(ctx, sector, FinalizeSector, func(ctx context.Context, ci storiface.CallID) (interface{}, error) {
-		if err := sb.FinalizeSector(ctx, sector, keepUnsealed); err != nil {
-			return nil, xerrors.Errorf("finalizing sector: %w", err)
-		}
-
-		if len(keepUnsealed) == 0 {
-			if err := l.storage.Remove(ctx, sector.ID, storiface.FTUnsealed, true, nil); err != nil {
-				return nil, xerrors.Errorf("removing unsealed data: %w", err)
-			}
-		}
-
-		return nil, err
+		return nil, sb.FinalizeSector(ctx, sector)
 	})
 }
 
-func (l *LocalWorker) FinalizeReplicaUpdate(ctx context.Context, sector storiface.SectorRef, keepUnsealed []storiface.Range) (storiface.CallID, error) {
-	sb, err := l.executor()
+func (l *LocalWorker) FinalizeReplicaUpdate(ctx context.Context, sector storiface.SectorRef) (storiface.CallID, error) {
+	sb, err := l.executor(l)
 	if err != nil {
 		return storiface.UndefCall, err
 	}
 
 	return l.asyncCall(ctx, sector, FinalizeReplicaUpdate, func(ctx context.Context, ci storiface.CallID) (interface{}, error) {
-		if err := sb.FinalizeReplicaUpdate(ctx, sector, keepUnsealed); err != nil {
+		return nil, sb.FinalizeReplicaUpdate(ctx, sector)
+	})
+}
+
+func (l *LocalWorker) ReleaseUnsealed(ctx context.Context, sector storiface.SectorRef, keepUnsealed []storiface.Range) (storiface.CallID, error) {
+	sb, err := l.executor(l)
+	if err != nil {
+		return storiface.UndefCall, err
+	}
+
+	return l.asyncCall(ctx, sector, ReleaseUnsealed, func(ctx context.Context, ci storiface.CallID) (interface{}, error) {
+		if err := sb.ReleaseUnsealed(ctx, sector, keepUnsealed); err != nil {
 			return nil, xerrors.Errorf("finalizing sector: %w", err)
 		}
 
@@ -516,10 +528,6 @@ func (l *LocalWorker) FinalizeReplicaUpdate(ctx context.Context, sector storifac
 
 		return nil, err
 	})
-}
-
-func (l *LocalWorker) ReleaseUnsealed(ctx context.Context, sector storiface.SectorRef, safeToFree []storiface.Range) (storiface.CallID, error) {
-	return storiface.UndefCall, xerrors.Errorf("implement me")
 }
 
 func (l *LocalWorker) Remove(ctx context.Context, sector abi.SectorID) error {
@@ -558,7 +566,7 @@ func (l *LocalWorker) MoveStorage(ctx context.Context, sector storiface.SectorRe
 }
 
 func (l *LocalWorker) UnsealPiece(ctx context.Context, sector storiface.SectorRef, index storiface.UnpaddedByteIndex, size abi.UnpaddedPieceSize, randomness abi.SealRandomness, cid cid.Cid) (storiface.CallID, error) {
-	sb, err := l.executor()
+	sb, err := l.executor(l)
 	if err != nil {
 		return storiface.UndefCall, err
 	}
@@ -569,22 +577,34 @@ func (l *LocalWorker) UnsealPiece(ctx context.Context, sector storiface.SectorRe
 			return nil, xerrors.Errorf("unsealing sector: %w", err)
 		}
 
-		if err = l.storage.RemoveCopies(ctx, sector.ID, storiface.FTSealed); err != nil {
-			return nil, xerrors.Errorf("removing source data: %w", err)
+		// note: the unsealed file is moved to long-term storage in Manager.SectorsUnsealPiece
+
+		storageTypes := []storiface.SectorFileType{storiface.FTSealed, storiface.FTCache, storiface.FTUpdate, storiface.FTUpdateCache}
+		for _, fileType := range storageTypes {
+			if err = l.storage.RemoveCopies(ctx, sector.ID, fileType); err != nil {
+				return nil, xerrors.Errorf("removing source data: %w", err)
+			}
 		}
 
-		if err = l.storage.RemoveCopies(ctx, sector.ID, storiface.FTCache); err != nil {
-			return nil, xerrors.Errorf("removing source data: %w", err)
-		}
-
-		log.Debugf("worker has unsealed piece, sector=%+v", sector.ID)
+		log.Debugf("unsealed piece, sector=%+v", sector.ID)
 
 		return nil, nil
 	})
 }
 
+func (l *LocalWorker) DownloadSectorData(ctx context.Context, sector storiface.SectorRef, finalized bool, src map[storiface.SectorFileType]storiface.SectorLocation) (storiface.CallID, error) {
+	sb, err := l.executor(l)
+	if err != nil {
+		return storiface.UndefCall, err
+	}
+
+	return l.asyncCall(ctx, sector, DownloadSector, func(ctx context.Context, ci storiface.CallID) (interface{}, error) {
+		return nil, sb.DownloadSectorData(ctx, sector, finalized, src)
+	})
+}
+
 func (l *LocalWorker) GenerateWinningPoSt(ctx context.Context, ppt abi.RegisteredPoStProof, mid abi.ActorID, sectors []storiface.PostSectorChallenge, randomness abi.PoStRandomness) ([]proof.PoStProof, error) {
-	sb, err := l.executor()
+	sb, err := l.executor(l)
 	if err != nil {
 		return nil, err
 	}
@@ -629,7 +649,11 @@ func (l *LocalWorker) GenerateWinningPoSt(ctx context.Context, ppt abi.Registere
 }
 
 func (l *LocalWorker) GenerateWindowPoSt(ctx context.Context, ppt abi.RegisteredPoStProof, mid abi.ActorID, sectors []storiface.PostSectorChallenge, partitionIdx int, randomness abi.PoStRandomness) (storiface.WindowPoStResult, error) {
-	sb, err := l.executor()
+	return l.GenerateWindowPoStAdv(ctx, ppt, mid, sectors, partitionIdx, randomness, false)
+}
+
+func (l *LocalWorker) GenerateWindowPoStAdv(ctx context.Context, ppt abi.RegisteredPoStProof, mid abi.ActorID, sectors []storiface.PostSectorChallenge, partitionIdx int, randomness abi.PoStRandomness, allowSkip bool) (storiface.WindowPoStResult, error) {
+	sb, err := l.executor(l)
 	if err != nil {
 		return storiface.WindowPoStResult{}, err
 	}
@@ -653,6 +677,8 @@ func (l *LocalWorker) GenerateWindowPoSt(ctx context.Context, ppt abi.Registered
 
 		go func(i int, s storiface.PostSectorChallenge) {
 			defer wg.Done()
+			ctx := ctx
+
 			defer func() {
 				if l.challengeThrottle != nil {
 					<-l.challengeThrottle
@@ -683,7 +709,7 @@ func (l *LocalWorker) GenerateWindowPoSt(ctx context.Context, ppt abi.Registered
 	}
 	wg.Wait()
 
-	if len(skipped) > 0 {
+	if len(skipped) > 0 && !allowSkip {
 		// This should happen rarely because before entering GenerateWindowPoSt we check all sectors by reading challenges.
 		// When it does happen, window post runner logic will just re-check sectors, and retry with newly-discovered-bad sectors skipped
 		log.Errorf("couldn't read some challenges (skipped %d)", len(skipped))
@@ -692,12 +718,32 @@ func (l *LocalWorker) GenerateWindowPoSt(ctx context.Context, ppt abi.Registered
 		return storiface.WindowPoStResult{Skipped: skipped}, nil
 	}
 
-	res, err := sb.GenerateWindowPoStWithVanilla(ctx, ppt, mid, randomness, vproofs, partitionIdx)
+	// compact skipped sectors
+	var skippedSoFar int
+	for i := range vproofs {
+		if len(vproofs[i]) == 0 {
+			skippedSoFar++
+			continue
+		}
 
-	return storiface.WindowPoStResult{
+		if skippedSoFar > 0 {
+			vproofs[i-skippedSoFar] = vproofs[i]
+		}
+	}
+
+	vproofs = vproofs[:len(vproofs)-skippedSoFar]
+
+	// compute the PoSt!
+	res, err := sb.GenerateWindowPoStWithVanilla(ctx, ppt, mid, randomness, vproofs, partitionIdx)
+	r := storiface.WindowPoStResult{
 		PoStProofs: res,
 		Skipped:    skipped,
-	}, err
+	}
+	if err != nil {
+		log.Errorw("generating window PoSt failed", "error", err)
+		return r, xerrors.Errorf("generate window PoSt with vanilla proofs: %w", err)
+	}
+	return r, nil
 }
 
 func (l *LocalWorker) TaskTypes(context.Context) (map[sealtasks.TaskType]struct{}, error) {
@@ -774,15 +820,11 @@ func (l *LocalWorker) memInfo() (memPhysical, memUsed, memSwap, memSwapUsed uint
 }
 
 func (l *LocalWorker) Info(context.Context) (storiface.WorkerInfo, error) {
-	hostname, err := os.Hostname() // TODO: allow overriding from config
-	if err != nil {
-		panic(err)
-	}
-
 	gpus, err := ffi.GetGPUDevices()
 	if err != nil {
 		log.Errorf("getting gpu devices failed: %+v", err)
 	}
+	log.Infow("Detected GPU devices.", "count", len(gpus))
 
 	memPhysical, memUsed, memSwap, memSwapUsed, err := l.memInfo()
 	if err != nil {
@@ -797,7 +839,7 @@ func (l *LocalWorker) Info(context.Context) (storiface.WorkerInfo, error) {
 	}
 
 	return storiface.WorkerInfo{
-		Hostname:        hostname,
+		Hostname:        l.name,
 		IgnoreResources: l.ignoreResources,
 		Resources: storiface.WorkerResources{
 			MemPhysical: memPhysical,
@@ -827,6 +869,10 @@ func (l *LocalWorker) Session(ctx context.Context) (uuid.UUID, error) {
 func (l *LocalWorker) Close() error {
 	close(l.closing)
 	return nil
+}
+
+func (l *LocalWorker) Done() <-chan struct{} {
+	return l.closing
 }
 
 // WaitQuiet blocks as long as there are tasks running

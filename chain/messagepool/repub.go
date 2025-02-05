@@ -11,6 +11,7 @@ import (
 	"github.com/filecoin-project/go-address"
 
 	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/messagepool/gasguess"
 	"github.com/filecoin-project/lotus/chain/types"
 )
@@ -20,19 +21,23 @@ const repubMsgLimit = 30
 var RepublishBatchDelay = 100 * time.Millisecond
 
 func (mp *MessagePool) republishPendingMessages(ctx context.Context) error {
-	mp.curTsLk.Lock()
+	mp.curTsLk.RLock()
 	ts := mp.curTs
+	mp.curTsLk.RUnlock()
 
 	baseFee, err := mp.api.ChainComputeBaseFee(context.TODO(), ts)
 	if err != nil {
-		mp.curTsLk.Unlock()
 		return xerrors.Errorf("computing basefee: %w", err)
 	}
 	baseFeeLowerBound := getBaseFeeLowerBound(baseFee, baseFeeLowerBoundFactor)
 
 	pending := make(map[address.Address]map[uint64]*types.SignedMessage)
+
 	mp.lk.Lock()
 	mp.republished = nil // clear this to avoid races triggering an early republish
+	mp.lk.Unlock()
+
+	mp.lk.RLock()
 	mp.forEachLocal(ctx, func(ctx context.Context, actor address.Address) {
 		mset, ok, err := mp.getPendingMset(ctx, actor)
 		if err != nil {
@@ -53,9 +58,7 @@ func (mp *MessagePool) republishPendingMessages(ctx context.Context) error {
 		}
 		pending[actor] = pend
 	})
-
-	mp.lk.Unlock()
-	mp.curTsLk.Unlock()
+	mp.lk.RUnlock()
 
 	if len(pending) == 0 {
 		return nil
@@ -79,7 +82,7 @@ func (mp *MessagePool) republishPendingMessages(ctx context.Context) error {
 		return chains[i].Before(chains[j])
 	})
 
-	gasLimit := int64(build.BlockGasLimit)
+	gasLimit := buildconstants.BlockGasLimit
 	minGas := int64(gasguess.MinGas)
 	var msgs []*types.SignedMessage
 loop:
@@ -176,8 +179,8 @@ loop:
 		republished[m.Cid()] = struct{}{}
 	}
 
-	mp.lk.Lock()
 	// update the republished set so that we can trigger early republish from head changes
+	mp.lk.Lock()
 	mp.republished = republished
 	mp.lk.Unlock()
 

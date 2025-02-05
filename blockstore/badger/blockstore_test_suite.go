@@ -1,4 +1,3 @@
-//stm: #unit
 package badgerbs
 
 import (
@@ -9,15 +8,17 @@ import (
 	"strings"
 	"testing"
 
+	u "github.com/ipfs/boxo/util"
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
-	u "github.com/ipfs/go-ipfs-util"
+	ipld "github.com/ipfs/go-ipld-format"
 	"github.com/stretchr/testify/require"
 
 	"github.com/filecoin-project/lotus/blockstore"
 )
 
 // TODO: move this to go-ipfs-blockstore.
+
 type Suite struct {
 	NewBlockstore  func(tb testing.TB) (bs blockstore.BasicBlockstore, path string)
 	OpenBlockstore func(tb testing.TB, path string) (bs blockstore.BasicBlockstore, err error)
@@ -44,8 +45,6 @@ func (s *Suite) RunTests(t *testing.T, prefix string) {
 }
 
 func (s *Suite) TestGetWhenKeyNotPresent(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_OPEN_001, @SPLITSTORE_BADGER_CLOSE_001
-	//stm: @SPLITSTORE_BADGER_GET_001, @SPLITSTORE_BADGER_POOLED_STORAGE_KEY_001
 	ctx := context.Background()
 	bs, _ := s.NewBlockstore(t)
 	if c, ok := bs.(io.Closer); ok {
@@ -55,12 +54,10 @@ func (s *Suite) TestGetWhenKeyNotPresent(t *testing.T) {
 	c := cid.NewCidV0(u.Hash([]byte("stuff")))
 	bl, err := bs.Get(ctx, c)
 	require.Nil(t, bl)
-	require.Equal(t, blockstore.ErrNotFound, err)
+	require.Equal(t, ipld.ErrNotFound{Cid: c}, err)
 }
 
 func (s *Suite) TestGetWhenKeyIsNil(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_OPEN_001, @SPLITSTORE_BADGER_CLOSE_001
-	//stm: @SPLITSTORE_BADGER_GET_001
 	ctx := context.Background()
 	bs, _ := s.NewBlockstore(t)
 	if c, ok := bs.(io.Closer); ok {
@@ -68,13 +65,10 @@ func (s *Suite) TestGetWhenKeyIsNil(t *testing.T) {
 	}
 
 	_, err := bs.Get(ctx, cid.Undef)
-	require.Equal(t, blockstore.ErrNotFound, err)
+	require.Equal(t, ipld.ErrNotFound{Cid: cid.Undef}, err)
 }
 
 func (s *Suite) TestPutThenGetBlock(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_OPEN_001, @SPLITSTORE_BADGER_CLOSE_001
-	//stm: @SPLITSTORE_BADGER_PUT_001, @SPLITSTORE_BADGER_POOLED_STORAGE_KEY_001
-	//stm: @SPLITSTORE_BADGER_GET_001
 	ctx := context.Background()
 	bs, _ := s.NewBlockstore(t)
 	if c, ok := bs.(io.Closer); ok {
@@ -92,8 +86,6 @@ func (s *Suite) TestPutThenGetBlock(t *testing.T) {
 }
 
 func (s *Suite) TestHas(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_OPEN_001, @SPLITSTORE_BADGER_CLOSE_001
-	//stm: @SPLITSTORE_BADGER_HAS_001, @SPLITSTORE_BADGER_POOLED_STORAGE_KEY_001
 	ctx := context.Background()
 	bs, _ := s.NewBlockstore(t)
 	if c, ok := bs.(io.Closer); ok {
@@ -115,9 +107,6 @@ func (s *Suite) TestHas(t *testing.T) {
 }
 
 func (s *Suite) TestCidv0v1(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_OPEN_001, @SPLITSTORE_BADGER_CLOSE_001
-	//stm: @SPLITSTORE_BADGER_PUT_001, @SPLITSTORE_BADGER_POOLED_STORAGE_KEY_001
-	//stm: @SPLITSTORE_BADGER_GET_001
 	ctx := context.Background()
 	bs, _ := s.NewBlockstore(t)
 	if c, ok := bs.(io.Closer); ok {
@@ -135,9 +124,6 @@ func (s *Suite) TestCidv0v1(t *testing.T) {
 }
 
 func (s *Suite) TestPutThenGetSizeBlock(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_OPEN_001, @SPLITSTORE_BADGER_CLOSE_001
-	//stm: @SPLITSTORE_BADGER_PUT_001, @SPLITSTORE_BADGER_POOLED_STORAGE_KEY_001
-	//stm: @SPLITSTORE_BADGER_GET_SIZE_001
 	ctx := context.Background()
 
 	bs, _ := s.NewBlockstore(t)
@@ -163,14 +149,13 @@ func (s *Suite) TestPutThenGetSizeBlock(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, emptySize)
 
-	missingSize, err := bs.GetSize(ctx, missingBlock.Cid())
-	require.Equal(t, blockstore.ErrNotFound, err)
+	missingCid := missingBlock.Cid()
+	missingSize, err := bs.GetSize(ctx, missingCid)
+	require.Equal(t, ipld.ErrNotFound{Cid: missingCid}, err)
 	require.Equal(t, -1, missingSize)
 }
 
 func (s *Suite) TestAllKeysSimple(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_OPEN_001, @SPLITSTORE_BADGER_CLOSE_001
-	//stm: @SPLITSTORE_BADGER_PUT_001, @SPLITSTORE_BADGER_POOLED_STORAGE_KEY_001
 	bs, _ := s.NewBlockstore(t)
 	if c, ok := bs.(io.Closer); ok {
 		defer func() { require.NoError(t, c.Close()) }()
@@ -187,9 +172,6 @@ func (s *Suite) TestAllKeysSimple(t *testing.T) {
 }
 
 func (s *Suite) TestAllKeysRespectsContext(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_OPEN_001, @SPLITSTORE_BADGER_CLOSE_001
-	//stm: @SPLITSTORE_BADGER_PUT_001, @SPLITSTORE_BADGER_POOLED_STORAGE_KEY_001
-	//stm: @SPLITSTORE_BADGER_ALL_KEYS_CHAN_001
 	bs, _ := s.NewBlockstore(t)
 	if c, ok := bs.(io.Closer); ok {
 		defer func() { require.NoError(t, c.Close()) }()
@@ -220,7 +202,6 @@ func (s *Suite) TestAllKeysRespectsContext(t *testing.T) {
 }
 
 func (s *Suite) TestDoubleClose(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_OPEN_001, @SPLITSTORE_BADGER_CLOSE_001
 	bs, _ := s.NewBlockstore(t)
 	c, ok := bs.(io.Closer)
 	if !ok {
@@ -231,9 +212,6 @@ func (s *Suite) TestDoubleClose(t *testing.T) {
 }
 
 func (s *Suite) TestReopenPutGet(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_OPEN_001, @SPLITSTORE_BADGER_CLOSE_001
-	//stm: @SPLITSTORE_BADGER_PUT_001, @SPLITSTORE_BADGER_POOLED_STORAGE_KEY_001
-	//stm: @SPLITSTORE_BADGER_GET_001
 	ctx := context.Background()
 	bs, path := s.NewBlockstore(t)
 	c, ok := bs.(io.Closer)
@@ -260,10 +238,6 @@ func (s *Suite) TestReopenPutGet(t *testing.T) {
 }
 
 func (s *Suite) TestPutMany(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_OPEN_001, @SPLITSTORE_BADGER_CLOSE_001
-	//stm: @SPLITSTORE_BADGER_HAS_001, @SPLITSTORE_BADGER_POOLED_STORAGE_KEY_001
-	//stm: @SPLITSTORE_BADGER_GET_001, @SPLITSTORE_BADGER_PUT_MANY_001
-	//stm: @SPLITSTORE_BADGER_ALL_KEYS_CHAN_001
 	ctx := context.Background()
 	bs, _ := s.NewBlockstore(t)
 	if c, ok := bs.(io.Closer); ok {
@@ -296,10 +270,6 @@ func (s *Suite) TestPutMany(t *testing.T) {
 }
 
 func (s *Suite) TestDelete(t *testing.T) {
-	//stm: @SPLITSTORE_BADGER_PUT_001, @SPLITSTORE_BADGER_POOLED_STORAGE_KEY_001
-	//stm: @SPLITSTORE_BADGER_DELETE_001, @SPLITSTORE_BADGER_POOLED_STORAGE_HAS_001
-	//stm: @SPLITSTORE_BADGER_ALL_KEYS_CHAN_001, @SPLITSTORE_BADGER_HAS_001
-	//stm: @SPLITSTORE_BADGER_PUT_MANY_001
 
 	ctx := context.Background()
 	bs, _ := s.NewBlockstore(t)

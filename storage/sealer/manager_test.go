@@ -1,4 +1,3 @@
-//stm: #unit
 package sealer
 
 import (
@@ -7,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,16 +16,20 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/ipfs/go-datastore"
+	syncds "github.com/ipfs/go-datastore/sync"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/xerrors"
 
 	ffi "github.com/filecoin-project/filecoin-ffi"
+	"github.com/filecoin-project/go-paramfetch"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/proof"
 	"github.com/filecoin-project/go-statestore"
 	proof7 "github.com/filecoin-project/specs-actors/v7/actors/runtime/proof"
 
+	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/storage/paths"
 	"github.com/filecoin-project/lotus/storage/sealer/ffiwrapper"
 	"github.com/filecoin-project/lotus/storage/sealer/fsutil"
@@ -39,18 +41,18 @@ func init() {
 	logging.SetAllLoggers(logging.LevelDebug)
 }
 
-type testStorage paths.StorageConfig
+type testStorage storiface.StorageConfig
 
 func (t testStorage) DiskUsage(path string) (int64, error) {
 	return 1, nil // close enough
 }
 
 func newTestStorage(t *testing.T) *testStorage {
-	tp, err := ioutil.TempDir(os.TempDir(), "sealer-test-")
+	tp, err := os.MkdirTemp(os.TempDir(), "sealer-test-")
 	require.NoError(t, err)
 
 	{
-		b, err := json.MarshalIndent(&paths.LocalStorageMeta{
+		b, err := json.MarshalIndent(&storiface.LocalStorageMeta{
 			ID:       storiface.ID(uuid.New().String()),
 			Weight:   1,
 			CanSeal:  true,
@@ -58,12 +60,12 @@ func newTestStorage(t *testing.T) *testStorage {
 		}, "", "  ")
 		require.NoError(t, err)
 
-		err = ioutil.WriteFile(filepath.Join(tp, "sectorstore.json"), b, 0644)
+		err = os.WriteFile(filepath.Join(tp, "sectorstore.json"), b, 0644)
 		require.NoError(t, err)
 	}
 
 	return &testStorage{
-		StoragePaths: []paths.LocalPath{
+		StoragePaths: []storiface.LocalPath{
 			{Path: tp},
 		},
 	}
@@ -82,12 +84,12 @@ func (t testStorage) cleanup() {
 	}
 }
 
-func (t testStorage) GetStorage() (paths.StorageConfig, error) {
-	return paths.StorageConfig(t), nil
+func (t testStorage) GetStorage() (storiface.StorageConfig, error) {
+	return storiface.StorageConfig(t), nil
 }
 
-func (t *testStorage) SetStorage(f func(*paths.StorageConfig)) error {
-	f((*paths.StorageConfig)(t))
+func (t *testStorage) SetStorage(f func(*storiface.StorageConfig)) error {
+	f((*storiface.StorageConfig)(t))
 	return nil
 }
 
@@ -97,10 +99,10 @@ func (t *testStorage) Stat(path string) (fsutil.FsStat, error) {
 
 var _ paths.LocalStorage = &testStorage{}
 
-func newTestMgr(ctx context.Context, t *testing.T, ds datastore.Datastore) (*Manager, *paths.Local, *paths.Remote, *paths.Index, func()) {
+func newTestMgr(ctx context.Context, t *testing.T, ds datastore.Datastore) (*Manager, *paths.Local, *paths.Remote, *paths.MemIndex, func()) {
 	st := newTestStorage(t)
 
-	si := paths.NewIndex()
+	si := paths.NewMemIndex(nil)
 
 	lstor, err := paths.NewLocal(ctx, st, si, nil)
 	require.NoError(t, err)
@@ -110,7 +112,7 @@ func newTestMgr(ctx context.Context, t *testing.T, ds datastore.Datastore) (*Man
 
 	stor := paths.NewRemote(lstor, si, nil, 6000, &paths.DefaultPartialFileHandler{})
 
-	sh, err := newScheduler("")
+	sh, err := newScheduler(ctx, "")
 	require.NoError(t, err)
 
 	m := &Manager{
@@ -144,11 +146,11 @@ func TestSimple(t *testing.T) {
 	logging.SetAllLoggers(logging.LevelDebug)
 
 	ctx := context.Background()
-	m, lstor, _, _, cleanup := newTestMgr(ctx, t, datastore.NewMapDatastore())
+	m, lstor, _, _, cleanup := newTestMgr(ctx, t, syncds.MutexWrap(datastore.NewMapDatastore()))
 	defer cleanup()
 
 	localTasks := []sealtasks.TaskType{
-		sealtasks.TTAddPiece, sealtasks.TTPreCommit1, sealtasks.TTCommit1, sealtasks.TTFinalize, sealtasks.TTFetch,
+		sealtasks.TTAddPiece, sealtasks.TTPreCommit1, sealtasks.TTCommit1, sealtasks.TTFinalize, sealtasks.TTFinalizeUnsealed, sealtasks.TTFetch,
 	}
 
 	err := m.AddWorker(ctx, newTestWorker(WorkerConfig{
@@ -198,18 +200,28 @@ func (m NullReader) NullBytes() int64 {
 	return m.N
 }
 
+func TestMain(m *testing.M) {
+	err := paramfetch.GetParams(context.TODO(), build.ParametersJSON(), build.SrsJSON(), uint64(2048))
+	if err != nil {
+		panic(xerrors.Errorf("failed to acquire Groth parameters for 2KiB sectors: %w", err))
+	}
+
+	code := m.Run()
+	os.Exit(code)
+}
+
 func TestSnapDeals(t *testing.T) {
 	logging.SetAllLoggers(logging.LevelWarn)
 	ctx := context.Background()
-	m, lstor, stor, idx, cleanup := newTestMgr(ctx, t, datastore.NewMapDatastore())
+	m, lstor, stor, idx, cleanup := newTestMgr(ctx, t, syncds.MutexWrap(datastore.NewMapDatastore()))
 	defer cleanup()
 
 	localTasks := []sealtasks.TaskType{
 		sealtasks.TTAddPiece, sealtasks.TTPreCommit1, sealtasks.TTPreCommit2, sealtasks.TTCommit1, sealtasks.TTCommit2, sealtasks.TTFinalize,
 		sealtasks.TTFetch, sealtasks.TTReplicaUpdate, sealtasks.TTProveReplicaUpdate1, sealtasks.TTProveReplicaUpdate2, sealtasks.TTUnseal,
-		sealtasks.TTRegenSectorKey,
+		sealtasks.TTRegenSectorKey, sealtasks.TTFinalizeUnsealed,
 	}
-	wds := datastore.NewMapDatastore()
+	wds := syncds.MutexWrap(datastore.NewMapDatastore())
 
 	w := NewLocalWorker(WorkerConfig{TaskTypes: localTasks}, stor, lstor, idx, m, statestore.New(wds))
 	err := m.AddWorker(ctx, w)
@@ -248,7 +260,7 @@ func TestSnapDeals(t *testing.T) {
 
 	// Precommit and Seal a CC sector
 	fmt.Printf("PC1\n")
-	ticket := abi.SealRandomness{9, 9, 9, 9, 9, 9, 9, 9}
+	ticket := abi.SealRandomness{9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9}
 	pc1Out, err := m.SealPreCommit1(ctx, sid, ticket, ccPieces)
 	require.NoError(t, err)
 	fmt.Printf("PC2\n")
@@ -304,13 +316,13 @@ func TestSnapDeals(t *testing.T) {
 
 	fmt.Printf("Decode\n")
 	// Remove unsealed data and decode for retrieval
-	require.NoError(t, m.FinalizeSector(ctx, sid, nil))
+	require.NoError(t, m.ReleaseUnsealed(ctx, sid, nil))
 	startDecode := time.Now()
 	require.NoError(t, m.SectorsUnsealPiece(ctx, sid, 0, p1.Size.Unpadded(), ticket, &out.NewUnsealed))
 	fmt.Printf("Decode duration (%s): %s\n", ss.ShortString(), time.Since(startDecode))
 
 	// Remove just the first piece and decode for retrieval
-	require.NoError(t, m.FinalizeSector(ctx, sid, []storiface.Range{{Offset: p1.Size.Unpadded(), Size: p2.Size.Unpadded()}}))
+	require.NoError(t, m.ReleaseUnsealed(ctx, sid, []storiface.Range{{Offset: p1.Size.Unpadded(), Size: p2.Size.Unpadded()}}))
 	require.NoError(t, m.SectorsUnsealPiece(ctx, sid, 0, p1.Size.Unpadded(), ticket, &out.NewUnsealed))
 
 	fmt.Printf("GSK\n")
@@ -320,7 +332,7 @@ func TestSnapDeals(t *testing.T) {
 	fmt.Printf("GSK duration (%s): %s\n", ss.ShortString(), time.Since(startGSK))
 
 	fmt.Printf("Remove data\n")
-	require.NoError(t, m.FinalizeSector(ctx, sid, nil))
+	require.NoError(t, m.ReleaseUnsealed(ctx, sid, nil))
 	fmt.Printf("Release Sector Key\n")
 	require.NoError(t, m.ReleaseSectorKey(ctx, sid))
 	fmt.Printf("Unseal Replica\n")
@@ -330,15 +342,15 @@ func TestSnapDeals(t *testing.T) {
 func TestSnarkPackV2(t *testing.T) {
 	logging.SetAllLoggers(logging.LevelWarn)
 	ctx := context.Background()
-	m, lstor, stor, idx, cleanup := newTestMgr(ctx, t, datastore.NewMapDatastore())
+	m, lstor, stor, idx, cleanup := newTestMgr(ctx, t, syncds.MutexWrap(datastore.NewMapDatastore()))
 	defer cleanup()
 
 	localTasks := []sealtasks.TaskType{
 		sealtasks.TTAddPiece, sealtasks.TTPreCommit1, sealtasks.TTPreCommit2, sealtasks.TTCommit1, sealtasks.TTCommit2, sealtasks.TTFinalize,
 		sealtasks.TTFetch, sealtasks.TTReplicaUpdate, sealtasks.TTProveReplicaUpdate1, sealtasks.TTProveReplicaUpdate2, sealtasks.TTUnseal,
-		sealtasks.TTRegenSectorKey,
+		sealtasks.TTRegenSectorKey, sealtasks.TTFinalizeUnsealed,
 	}
-	wds := datastore.NewMapDatastore()
+	wds := syncds.MutexWrap(datastore.NewMapDatastore())
 
 	w := NewLocalWorker(WorkerConfig{TaskTypes: localTasks}, stor, lstor, idx, m, statestore.New(wds))
 	err := m.AddWorker(ctx, w)
@@ -472,11 +484,11 @@ func TestRedoPC1(t *testing.T) {
 	logging.SetAllLoggers(logging.LevelDebug)
 
 	ctx := context.Background()
-	m, lstor, _, _, cleanup := newTestMgr(ctx, t, datastore.NewMapDatastore())
+	m, lstor, _, _, cleanup := newTestMgr(ctx, t, syncds.MutexWrap(datastore.NewMapDatastore()))
 	defer cleanup()
 
 	localTasks := []sealtasks.TaskType{
-		sealtasks.TTAddPiece, sealtasks.TTPreCommit1, sealtasks.TTCommit1, sealtasks.TTFinalize, sealtasks.TTFetch,
+		sealtasks.TTAddPiece, sealtasks.TTPreCommit1, sealtasks.TTCommit1, sealtasks.TTFinalize, sealtasks.TTFinalizeUnsealed, sealtasks.TTFetch,
 	}
 
 	tw := newTestWorker(WorkerConfig{
@@ -517,7 +529,6 @@ func TestRedoPC1(t *testing.T) {
 
 // Manager restarts in the middle of a task, restarts it, it completes
 func TestRestartManager(t *testing.T) {
-	//stm: @WORKER_JOBS_001
 	test := func(returnBeforeCall bool) func(*testing.T) {
 		return func(t *testing.T) {
 			logging.SetAllLoggers(logging.LevelDebug)
@@ -525,13 +536,13 @@ func TestRestartManager(t *testing.T) {
 			ctx, done := context.WithCancel(context.Background())
 			defer done()
 
-			ds := datastore.NewMapDatastore()
+			ds := syncds.MutexWrap(datastore.NewMapDatastore())
 
 			m, lstor, _, _, cleanup := newTestMgr(ctx, t, ds)
 			defer cleanup()
 
 			localTasks := []sealtasks.TaskType{
-				sealtasks.TTAddPiece, sealtasks.TTPreCommit1, sealtasks.TTCommit1, sealtasks.TTFinalize, sealtasks.TTFetch,
+				sealtasks.TTAddPiece, sealtasks.TTPreCommit1, sealtasks.TTCommit1, sealtasks.TTFinalize, sealtasks.TTFinalizeUnsealed, sealtasks.TTFetch,
 			}
 
 			tw := newTestWorker(WorkerConfig{
@@ -623,7 +634,7 @@ func TestRestartWorker(t *testing.T) {
 	ctx, done := context.WithCancel(context.Background())
 	defer done()
 
-	ds := datastore.NewMapDatastore()
+	ds := syncds.MutexWrap(datastore.NewMapDatastore())
 
 	m, lstor, stor, idx, cleanup := newTestMgr(ctx, t, ds)
 	defer cleanup()
@@ -632,10 +643,10 @@ func TestRestartWorker(t *testing.T) {
 		sealtasks.TTAddPiece, sealtasks.TTFetch,
 	}
 
-	wds := datastore.NewMapDatastore()
+	wds := syncds.MutexWrap(datastore.NewMapDatastore())
 
 	arch := make(chan chan apres)
-	w := newLocalWorker(func() (storiface.Storage, error) {
+	w := NewLocalWorkerWithExecutor(func(_ *LocalWorker) (storiface.Storage, error) {
 		return &testExec{apch: arch}, nil
 	}, WorkerConfig{
 		TaskTypes: localTasks,
@@ -662,7 +673,6 @@ func TestRestartWorker(t *testing.T) {
 	<-arch
 	require.NoError(t, w.Close())
 
-	//stm: @WORKER_STATS_001
 	for {
 		if len(m.WorkerStats(ctx)) == 0 {
 			break
@@ -672,7 +682,7 @@ func TestRestartWorker(t *testing.T) {
 	}
 
 	// restart the worker
-	w = newLocalWorker(func() (storiface.Storage, error) {
+	w = NewLocalWorkerWithExecutor(func(_ *LocalWorker) (storiface.Storage, error) {
 		return &testExec{apch: arch}, nil
 	}, WorkerConfig{
 		TaskTypes: localTasks,
@@ -696,19 +706,19 @@ func TestReenableWorker(t *testing.T) {
 	ctx, done := context.WithCancel(context.Background())
 	defer done()
 
-	ds := datastore.NewMapDatastore()
+	ds := syncds.MutexWrap(datastore.NewMapDatastore())
 
 	m, lstor, stor, idx, cleanup := newTestMgr(ctx, t, ds)
 	defer cleanup()
 
 	localTasks := []sealtasks.TaskType{
-		sealtasks.TTAddPiece, sealtasks.TTPreCommit1, sealtasks.TTCommit1, sealtasks.TTFinalize, sealtasks.TTFetch,
+		sealtasks.TTAddPiece, sealtasks.TTPreCommit1, sealtasks.TTCommit1, sealtasks.TTFinalize, sealtasks.TTFinalizeUnsealed, sealtasks.TTFetch,
 	}
 
 	wds := datastore.NewMapDatastore()
 
 	arch := make(chan chan apres)
-	w := newLocalWorker(func() (storiface.Storage, error) {
+	w := NewLocalWorkerWithExecutor(func(_ *LocalWorker) (storiface.Storage, error) {
 		return &testExec{apch: arch}, nil
 	}, WorkerConfig{
 		TaskTypes: localTasks,
@@ -725,7 +735,6 @@ func TestReenableWorker(t *testing.T) {
 	// disable
 	atomic.StoreInt64(&w.testDisable, 1)
 
-	//stm: @WORKER_STATS_001
 	for i := 0; i < 100; i++ {
 		if !m.WorkerStats(ctx)[w.session].Enabled {
 			break
@@ -769,7 +778,7 @@ func TestResUse(t *testing.T) {
 	ctx, done := context.WithCancel(context.Background())
 	defer done()
 
-	ds := datastore.NewMapDatastore()
+	ds := syncds.MutexWrap(datastore.NewMapDatastore())
 
 	m, lstor, stor, idx, cleanup := newTestMgr(ctx, t, ds)
 	defer cleanup()
@@ -778,10 +787,10 @@ func TestResUse(t *testing.T) {
 		sealtasks.TTAddPiece, sealtasks.TTFetch,
 	}
 
-	wds := datastore.NewMapDatastore()
+	wds := syncds.MutexWrap(datastore.NewMapDatastore())
 
 	arch := make(chan chan apres)
-	w := newLocalWorker(func() (storiface.Storage, error) {
+	w := NewLocalWorkerWithExecutor(func(_ *LocalWorker) (storiface.Storage, error) {
 		return &testExec{apch: arch}, nil
 	}, WorkerConfig{
 		TaskTypes: localTasks,
@@ -827,7 +836,7 @@ func TestResOverride(t *testing.T) {
 	ctx, done := context.WithCancel(context.Background())
 	defer done()
 
-	ds := datastore.NewMapDatastore()
+	ds := syncds.MutexWrap(datastore.NewMapDatastore())
 
 	m, lstor, stor, idx, cleanup := newTestMgr(ctx, t, ds)
 	defer cleanup()
@@ -836,10 +845,10 @@ func TestResOverride(t *testing.T) {
 		sealtasks.TTAddPiece, sealtasks.TTFetch,
 	}
 
-	wds := datastore.NewMapDatastore()
+	wds := syncds.MutexWrap(datastore.NewMapDatastore())
 
 	arch := make(chan chan apres)
-	w := newLocalWorker(func() (storiface.Storage, error) {
+	w := NewLocalWorkerWithExecutor(func(_ *LocalWorker) (storiface.Storage, error) {
 		return &testExec{apch: arch}, nil
 	}, WorkerConfig{
 		TaskTypes: localTasks,

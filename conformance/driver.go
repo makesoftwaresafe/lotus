@@ -11,23 +11,28 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/filecoin-project/go-state-types/network"
+	rtt "github.com/filecoin-project/go-state-types/rt"
 	"github.com/filecoin-project/test-vectors/schema"
 
 	"github.com/filecoin-project/lotus/blockstore"
-	"github.com/filecoin-project/lotus/chain/actors"
+	"github.com/filecoin-project/lotus/chain/actors/builtin"
+	"github.com/filecoin-project/lotus/chain/consensus"
 	"github.com/filecoin-project/lotus/chain/consensus/filcns"
+	proofsffi "github.com/filecoin-project/lotus/chain/proofs/ffi"
+	"github.com/filecoin-project/lotus/chain/rand"
 	"github.com/filecoin-project/lotus/chain/state"
 	"github.com/filecoin-project/lotus/chain/stmgr"
 	"github.com/filecoin-project/lotus/chain/store"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/vm"
 	"github.com/filecoin-project/lotus/conformance/chaos"
-	_ "github.com/filecoin-project/lotus/lib/sigs/bls"  // enable bls signatures
+	_ "github.com/filecoin-project/lotus/lib/sigs/bls" // enable bls signatures
+	_ "github.com/filecoin-project/lotus/lib/sigs/delegated"
 	_ "github.com/filecoin-project/lotus/lib/sigs/secp" // enable secp signatures
-	"github.com/filecoin-project/lotus/storage/sealer/ffiwrapper"
 )
 
 var (
@@ -84,9 +89,9 @@ type ExecuteTipsetParams struct {
 	ParentEpoch abi.ChainEpoch
 	Tipset      *schema.Tipset
 	ExecEpoch   abi.ChainEpoch
-	// Rand is an optional vm.Rand implementation to use. If nil, the driver
-	// will use a vm.Rand that returns a fixed value for all calls.
-	Rand vm.Rand
+	// Rand is an optional rand.Rand implementation to use. If nil, the driver
+	// will use a rand.Rand that returns a fixed value for all calls.
+	Rand rand.Rand
 	// BaseFee if not nil or zero, will override the basefee of the tipset.
 	BaseFee abi.TokenAmount
 }
@@ -94,17 +99,17 @@ type ExecuteTipsetParams struct {
 // ExecuteTipset executes the supplied tipset on top of the state represented
 // by the preroot CID.
 //
-// This method returns the the receipts root, the poststate root, and the VM
+// This method returns the receipts root, the poststate root, and the VM
 // message results. The latter _include_ implicit messages, such as cron ticks
 // and reward withdrawal per miner.
 func (d *Driver) ExecuteTipset(bs blockstore.Blockstore, ds ds.Batching, params ExecuteTipsetParams) (*ExecuteTipsetResult, error) {
 	var (
 		tipset   = params.Tipset
-		syscalls = vm.Syscalls(ffiwrapper.ProofVerifier)
+		syscalls = vm.Syscalls(proofsffi.ProofVerifier)
 
 		cs      = store.NewChainStore(bs, bs, ds, filcns.Weight, nil)
-		tse     = filcns.NewTipSetExecutor()
-		sm, err = stmgr.NewStateManager(cs, tse, syscalls, filcns.DefaultUpgradeSchedule(), nil)
+		tse     = consensus.NewTipSetExecutor(filcns.RewardFunc)
+		sm, err = stmgr.NewStateManager(cs, tse, syscalls, filcns.DefaultUpgradeSchedule(), nil, ds, nil)
 	)
 	if err != nil {
 		return nil, err
@@ -120,7 +125,7 @@ func (d *Driver) ExecuteTipset(bs blockstore.Blockstore, ds ds.Batching, params 
 
 	defer cs.Close() //nolint:errcheck
 
-	blocks := make([]filcns.FilecoinBlockMessages, 0, len(tipset.Blocks))
+	blocks := make([]consensus.FilecoinBlockMessages, 0, len(tipset.Blocks))
 	for _, b := range tipset.Blocks {
 		sb := store.BlockMessages{
 			Miner: b.MinerAddr,
@@ -142,7 +147,7 @@ func (d *Driver) ExecuteTipset(bs blockstore.Blockstore, ds ds.Batching, params 
 				sb.BlsMessages = append(sb.BlsMessages, msg)
 			}
 		}
-		blocks = append(blocks, filcns.FilecoinBlockMessages{
+		blocks = append(blocks, consensus.FilecoinBlockMessages{
 			BlockMessages: sb,
 			WinCount:      b.WinCount,
 		})
@@ -158,7 +163,7 @@ func (d *Driver) ExecuteTipset(bs blockstore.Blockstore, ds ds.Batching, params 
 			return big.Zero(), nil
 		}
 
-		return vm.NewLegacyVM(ctx, vmopt)
+		return vm.NewVM(ctx, vmopt)
 	})
 
 	postcid, receiptsroot, err := tse.ApplyBlocks(context.Background(),
@@ -169,6 +174,7 @@ func (d *Driver) ExecuteTipset(bs blockstore.Blockstore, ds ds.Batching, params 
 		params.ExecEpoch,
 		params.Rand,
 		recordOutputs,
+		true,
 		params.BaseFee,
 		nil,
 	)
@@ -189,17 +195,21 @@ func (d *Driver) ExecuteTipset(bs blockstore.Blockstore, ds ds.Batching, params 
 type ExecuteMessageParams struct {
 	Preroot        cid.Cid
 	Epoch          abi.ChainEpoch
+	Timestamp      uint64
 	Message        *types.Message
 	CircSupply     abi.TokenAmount
 	BaseFee        abi.TokenAmount
 	NetworkVersion network.Version
 
-	// Rand is an optional vm.Rand implementation to use. If nil, the driver
-	// will use a vm.Rand that returns a fixed value for all calls.
-	Rand vm.Rand
+	// Rand is an optional rand.Rand implementation to use. If nil, the driver
+	// will use a rand.Rand that returns a fixed value for all calls.
+	Rand rand.Rand
 
 	// Lookback is the LookbackStateGetter; returns the state tree at a given epoch.
 	Lookback vm.LookbackStateGetter
+
+	// TipSetGetter returns the tipset key at any given epoch.
+	TipSetGetter vm.TipSetGetter
 }
 
 // ExecuteMessage executes a conformance test vector message in a temporary VM.
@@ -214,58 +224,87 @@ func (d *Driver) ExecuteMessage(bs blockstore.Blockstore, params ExecuteMessageP
 		params.Rand = NewFixedRand()
 	}
 
-	// TODO: This lookback state returns the supplied precondition state tree, unconditionally.
-	//  This is obviously not correct, but the lookback state tree is only used to validate the
-	//  worker key when verifying a consensus fault. If the worker key hasn't changed in the
-	//  current finality window, this workaround is enough.
-	//  The correct solutions are documented in https://github.com/filecoin-project/ref-fvm/issues/381,
-	//  but they're much harder to implement, and the tradeoffs aren't clear.
-	var lookback vm.LookbackStateGetter = func(ctx context.Context, epoch abi.ChainEpoch) (*state.StateTree, error) {
-		cst := cbor.NewCborStore(bs)
-		return state.LoadStateTree(cst, params.Preroot)
+	if params.TipSetGetter == nil {
+		// TODO: If/when we start writing conformance tests against the EVM, we'll need to
+		// actually implement this and (unfortunately) capture any tipsets looked up by
+		// messages.
+		params.TipSetGetter = func(context.Context, abi.ChainEpoch) (types.TipSetKey, error) {
+			return types.EmptyTSK, nil
+		}
+	}
+
+	if params.Lookback == nil {
+		// TODO: This lookback state returns the supplied precondition state tree, unconditionally.
+		//  This is obviously not correct, but the lookback state tree is only used to validate the
+		//  worker key when verifying a consensus fault. If the worker key hasn't changed in the
+		//  current finality window, this workaround is enough.
+		//  The correct solutions are documented in https://github.com/filecoin-project/ref-fvm/issues/381,
+		//  but they're much harder to implement, and the tradeoffs aren't clear.
+		params.Lookback = func(ctx context.Context, epoch abi.ChainEpoch) (*state.StateTree, error) {
+			cst := cbor.NewCborStore(bs)
+			return state.LoadStateTree(cst, params.Preroot)
+		}
 	}
 
 	vmOpts := &vm.VMOpts{
 		StateBase: params.Preroot,
 		Epoch:     params.Epoch,
+		Timestamp: params.Timestamp,
 		Bstore:    bs,
-		Syscalls:  vm.Syscalls(ffiwrapper.ProofVerifier),
+		Syscalls:  vm.Syscalls(proofsffi.ProofVerifier),
 		CircSupplyCalc: func(_ context.Context, _ abi.ChainEpoch, _ *state.StateTree) (abi.TokenAmount, error) {
 			return params.CircSupply, nil
 		},
 		Rand:           params.Rand,
 		BaseFee:        params.BaseFee,
 		NetworkVersion: params.NetworkVersion,
-		LookbackState:  lookback,
+		LookbackState:  params.Lookback,
+		TipSetGetter:   params.TipSetGetter,
 	}
 
-	lvm, err := vm.NewLegacyVM(context.TODO(), vmOpts)
-	if err != nil {
-		return nil, cid.Undef, err
-	}
-
-	invoker := filcns.NewActorRegistry()
-
-	// register the chaos actor if required by the vector.
+	var vmi vm.Interface
 	if chaosOn, ok := d.selector["chaos_actor"]; ok && chaosOn == "true" {
-		av, _ := actors.VersionForNetwork(params.NetworkVersion)
-		invoker.Register(av, nil, chaos.Actor{})
+		lvm, err := vm.NewLegacyVM(context.TODO(), vmOpts)
+		if err != nil {
+			return nil, cid.Undef, err
+		}
+
+		invoker := consensus.NewActorRegistry()
+		av, _ := actorstypes.VersionForNetwork(params.NetworkVersion)
+		registry := builtin.MakeRegistryLegacy([]rtt.VMActor{chaos.Actor{}})
+		invoker.Register(av, nil, registry)
+		lvm.SetInvoker(invoker)
+		vmi = lvm
+	} else {
+		if vmOpts.NetworkVersion >= network.Version16 {
+			fvm, err := vm.NewFVM(context.TODO(), vmOpts)
+			if err != nil {
+				return nil, cid.Undef, err
+			}
+			vmi = fvm
+		} else {
+			lvm, err := vm.NewLegacyVM(context.TODO(), vmOpts)
+			if err != nil {
+				return nil, cid.Undef, err
+			}
+			invoker := consensus.NewActorRegistry()
+			lvm.SetInvoker(invoker)
+			vmi = lvm
+		}
 	}
 
-	lvm.SetInvoker(invoker)
-
-	ret, err := lvm.ApplyMessage(d.ctx, toChainMsg(params.Message))
+	ret, err := vmi.ApplyMessage(d.ctx, toChainMsg(params.Message))
 	if err != nil {
 		return nil, cid.Undef, err
 	}
 
 	var root cid.Cid
-	if d.vmFlush {
-		// flush the VM, committing the state tree changes and forcing a
-		// recursive copoy from the temporary blcokstore to the real blockstore.
-		root, err = lvm.Flush(d.ctx)
-	} else {
+	if lvm, ok := vmi.(*vm.LegacyVM); ok && !d.vmFlush {
 		root, err = lvm.StateTree().(*state.StateTree).Flush(d.ctx)
+	} else {
+		// flush the VM, committing the state tree changes and forcing a
+		// recursive copy from the temporary blockstore to the real blockstore.
+		root, err = vmi.Flush(d.ctx)
 	}
 
 	return ret, root, err
@@ -275,7 +314,8 @@ func (d *Driver) ExecuteMessage(bs blockstore.Blockstore, params ExecuteMessageP
 // messages that originate from secp256k senders, leaving all
 // others untouched.
 // TODO: generate a signature in the DSL so that it's encoded in
-//  the test vector.
+//
+//	the test vector.
 func toChainMsg(msg *types.Message) (ret types.ChainMsg) {
 	ret = msg
 	if msg.From.Protocol() == address.SECP256K1 {

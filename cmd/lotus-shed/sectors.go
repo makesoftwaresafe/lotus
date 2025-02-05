@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/cheggaaa/pb/v3"
 	"github.com/ipfs/go-cid"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
@@ -28,9 +29,17 @@ import (
 
 	"github.com/filecoin-project/lotus/api/v0api"
 	"github.com/filecoin-project/lotus/chain/actors"
+	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
+	"github.com/filecoin-project/lotus/chain/actors/builtin/power"
 	"github.com/filecoin-project/lotus/chain/types"
 	lcli "github.com/filecoin-project/lotus/cli"
+	"github.com/filecoin-project/lotus/cli/spcli"
 	"github.com/filecoin-project/lotus/lib/parmap"
+	"github.com/filecoin-project/lotus/node/repo"
+	"github.com/filecoin-project/lotus/storage/paths"
+	"github.com/filecoin-project/lotus/storage/sealer/fr32"
+	"github.com/filecoin-project/lotus/storage/sealer/fsutil"
+	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
 var sectorsCmd = &cli.Command{
@@ -38,130 +47,24 @@ var sectorsCmd = &cli.Command{
 	Usage: "Tools for interacting with sectors",
 	Flags: []cli.Flag{},
 	Subcommands: []*cli.Command{
-		terminateSectorCmd,
+		spcli.TerminateSectorCmd(shedGetActor),
 		terminateSectorPenaltyEstimationCmd,
 		visAllocatedSectorsCmd,
 		dumpRLESectorCmd,
+		dumpSectorOnChainInfoCmd,
+		sectorReadCmd,
+		sectorDeleteCmd,
 	},
 }
 
-var terminateSectorCmd = &cli.Command{
-	Name:      "terminate",
-	Usage:     "Forcefully terminate a sector (WARNING: This means losing power and pay a one-time termination penalty(including collateral) for the terminated sector)",
-	ArgsUsage: "[sectorNum1 sectorNum2 ...]",
-	Flags: []cli.Flag{
-		&cli.StringFlag{
-			Name:  "actor",
-			Usage: "specify the address of miner actor",
-		},
-		&cli.BoolFlag{
-			Name:  "really-do-it",
-			Usage: "pass this flag if you know what you are doing",
-		},
-	},
-	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() < 1 {
-			return fmt.Errorf("at least one sector must be specified")
-		}
+func shedGetActor(cctx *cli.Context) (address.Address, error) {
+	minerApi, acloser, err := lcli.GetStorageMinerAPI(cctx)
+	if err != nil {
+		return address.Address{}, err
+	}
+	defer acloser()
 
-		var maddr address.Address
-		if act := cctx.String("actor"); act != "" {
-			var err error
-			maddr, err = address.NewFromString(act)
-			if err != nil {
-				return fmt.Errorf("parsing address %s: %w", act, err)
-			}
-		}
-
-		if !cctx.Bool("really-do-it") {
-			return fmt.Errorf("this is a command for advanced users, only use it if you are sure of what you are doing")
-		}
-
-		nodeApi, closer, err := lcli.GetFullNodeAPI(cctx)
-		if err != nil {
-			return err
-		}
-		defer closer()
-
-		ctx := lcli.ReqContext(cctx)
-
-		if maddr.Empty() {
-			api, acloser, err := lcli.GetStorageMinerAPI(cctx)
-			if err != nil {
-				return err
-			}
-			defer acloser()
-
-			maddr, err = api.ActorAddress(ctx)
-			if err != nil {
-				return err
-			}
-		}
-
-		mi, err := nodeApi.StateMinerInfo(ctx, maddr, types.EmptyTSK)
-		if err != nil {
-			return err
-		}
-
-		terminationDeclarationParams := []miner2.TerminationDeclaration{}
-
-		for _, sn := range cctx.Args().Slice() {
-			sectorNum, err := strconv.ParseUint(sn, 10, 64)
-			if err != nil {
-				return fmt.Errorf("could not parse sector number: %w", err)
-			}
-
-			sectorbit := bitfield.New()
-			sectorbit.Set(sectorNum)
-
-			loca, err := nodeApi.StateSectorPartition(ctx, maddr, abi.SectorNumber(sectorNum), types.EmptyTSK)
-			if err != nil {
-				return fmt.Errorf("get state sector partition %s", err)
-			}
-
-			para := miner2.TerminationDeclaration{
-				Deadline:  loca.Deadline,
-				Partition: loca.Partition,
-				Sectors:   sectorbit,
-			}
-
-			terminationDeclarationParams = append(terminationDeclarationParams, para)
-		}
-
-		terminateSectorParams := &miner2.TerminateSectorsParams{
-			Terminations: terminationDeclarationParams,
-		}
-
-		sp, err := actors.SerializeParams(terminateSectorParams)
-		if err != nil {
-			return xerrors.Errorf("serializing params: %w", err)
-		}
-
-		smsg, err := nodeApi.MpoolPushMessage(ctx, &types.Message{
-			From:   mi.Owner,
-			To:     maddr,
-			Method: builtin.MethodsMiner.TerminateSectors,
-
-			Value:  big.Zero(),
-			Params: sp,
-		}, nil)
-		if err != nil {
-			return xerrors.Errorf("mpool push message: %w", err)
-		}
-
-		fmt.Println("sent termination message:", smsg.Cid())
-
-		wait, err := nodeApi.StateWaitMsg(ctx, smsg.Cid(), uint64(cctx.Int("confidence")))
-		if err != nil {
-			return err
-		}
-
-		if wait.Receipt.ExitCode != 0 {
-			return fmt.Errorf("terminate sectors message returned exit %d", wait.Receipt.ExitCode)
-		}
-
-		return nil
-	},
+	return minerApi.ActorAddress(cctx.Context)
 }
 
 func findPenaltyInInternalExecutions(prefix string, trace []types.ExecutionTrace) {
@@ -185,8 +88,8 @@ var terminateSectorPenaltyEstimationCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() < 1 {
-			return fmt.Errorf("at least one sector must be specified")
+		if cctx.NArg() < 1 {
+			return lcli.ShowHelp(cctx, fmt.Errorf("at least one sector must be specified"))
 		}
 
 		var maddr address.Address
@@ -207,13 +110,13 @@ var terminateSectorPenaltyEstimationCmd = &cli.Command{
 		ctx := lcli.ReqContext(cctx)
 
 		if maddr.Empty() {
-			api, acloser, err := lcli.GetStorageMinerAPI(cctx)
+			minerApi, acloser, err := lcli.GetStorageMinerAPI(cctx)
 			if err != nil {
 				return err
 			}
 			defer acloser()
 
-			maddr, err = api.ActorAddress(ctx)
+			maddr, err = minerApi.ActorAddress(ctx)
 			if err != nil {
 				return err
 			}
@@ -222,6 +125,18 @@ var terminateSectorPenaltyEstimationCmd = &cli.Command{
 		mi, err := nodeApi.StateMinerInfo(ctx, maddr, types.EmptyTSK)
 		if err != nil {
 			return err
+		}
+
+		ownerAddr, err := nodeApi.StateAccountKey(ctx, mi.Owner, types.EmptyTSK)
+		if err != nil {
+			ownerAddr = mi.Owner
+		}
+
+		var fromAddr address.Address
+		if ownerAddr.Protocol() == address.Delegated {
+			fromAddr = mi.Worker
+		} else {
+			fromAddr = mi.Owner
 		}
 
 		terminationDeclarationParams := []miner2.TerminationDeclaration{}
@@ -259,7 +174,7 @@ var terminateSectorPenaltyEstimationCmd = &cli.Command{
 		}
 
 		msg := &types.Message{
-			From:   mi.Owner,
+			From:   fromAddr,
 			To:     maddr,
 			Method: builtin.MethodsMiner.TerminateSectors,
 
@@ -548,3 +463,301 @@ func rleToPng(rleBytes []byte) ([]byte, error) {
 
 	return buf.Bytes(), nil
 }
+
+var sectorReadCmd = &cli.Command{
+	Name:      "read",
+	Usage:     "read data from a sector into stdout",
+	ArgsUsage: "[sector num] [padded length] [padded offset]",
+	Description: `Read data from a sector.
+
+TIP: to get sectornum/len/offset for a piece you can use 'boostd pieces piece-info [cid]'
+
+fr32 padding is removed from the output.`,
+	Action: func(cctx *cli.Context) error {
+		if cctx.NArg() != 3 {
+			return xerrors.Errorf("must pass sectornum/len/offset")
+		}
+
+		sectorNum, err := strconv.ParseUint(cctx.Args().Get(0), 10, 64)
+		if err != nil {
+			return xerrors.Errorf("parsing sector number: %w", err)
+		}
+
+		length, err := strconv.ParseUint(cctx.Args().Get(1), 10, 64)
+		if err != nil {
+			return xerrors.Errorf("parsing length: %w", err)
+		}
+
+		offset, err := strconv.ParseUint(cctx.Args().Get(2), 10, 64)
+		if err != nil {
+			return xerrors.Errorf("parsing offset: %w", err)
+		}
+
+		ctx := lcli.ReqContext(cctx)
+		api, closer, err := lcli.GetStorageMinerAPI(cctx)
+		if err != nil {
+			return err
+		}
+
+		maddr, err := api.ActorAddress(ctx)
+		if err != nil {
+			return xerrors.Errorf("getting miner actor address: %w", err)
+		}
+
+		mid, err := address.IDFromAddress(maddr)
+		if err != nil {
+			return xerrors.Errorf("getting miner id: %w", err)
+		}
+
+		sid := abi.SectorID{
+			Miner:  abi.ActorID(mid),
+			Number: abi.SectorNumber(sectorNum),
+		}
+
+		si, err := api.SectorsStatus(ctx, sid.Number, false)
+		if err != nil {
+			return xerrors.Errorf("getting sector status: %w", err)
+		}
+
+		sref := storiface.SectorRef{
+			ID:        sid,
+			ProofType: si.SealProof,
+		}
+
+		defer closer()
+
+		// Setup remote sector store
+		sminfo, err := lcli.GetAPIInfo(cctx, repo.StorageMiner)
+		if err != nil {
+			return xerrors.Errorf("could not get api info: %w", err)
+		}
+
+		localStore, err := paths.NewLocal(ctx, &emptyLocalStorage{}, api, []string{})
+		if err != nil {
+			return err
+		}
+
+		remote := paths.NewRemote(localStore, api, sminfo.AuthHeader(), 10,
+			&paths.DefaultPartialFileHandler{})
+
+		readStarter, err := remote.Reader(ctx, sref, abi.PaddedPieceSize(offset), abi.PaddedPieceSize(length))
+		if err != nil {
+			return xerrors.Errorf("getting reader: %w", err)
+		}
+
+		rd, err := readStarter(0, storiface.PaddedByteIndex(length))
+		if err != nil {
+			return xerrors.Errorf("starting reader: %w", err)
+		}
+
+		upr, err := fr32.NewUnpadReaderBuf(rd, abi.PaddedPieceSize(length), make([]byte, 1<<20))
+		if err != nil {
+			return xerrors.Errorf("creating unpadded reader: %w", err)
+		}
+
+		l := int64(abi.PaddedPieceSize(length).Unpadded())
+
+		bar := pb.Full.Start64(l)
+		br := bar.NewProxyReader(upr)
+
+		_, err = io.CopyN(os.Stdout, br, l)
+
+		bar.Finish()
+
+		if err != nil {
+			return xerrors.Errorf("reading data: %w", err)
+		}
+		return nil
+	},
+}
+
+var sectorDeleteCmd = &cli.Command{
+	Name:  "delete",
+	Usage: "delete a sector file from sector storage",
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name: "really-do-it",
+		},
+	},
+	ArgsUsage: "[sector num] [file type]",
+	Action: func(cctx *cli.Context) error {
+		if cctx.NArg() != 2 {
+			return xerrors.Errorf("must pass sectornum/filetype")
+		}
+
+		sectorNum, err := strconv.ParseUint(cctx.Args().Get(0), 10, 64)
+		if err != nil {
+			return xerrors.Errorf("parsing sector number: %w", err)
+		}
+
+		var ft storiface.SectorFileType
+		switch cctx.Args().Get(1) {
+		case "cache":
+			ft = storiface.FTCache
+		case "sealed":
+			ft = storiface.FTSealed
+		case "unsealed":
+			ft = storiface.FTUnsealed
+		case "update-cache":
+			ft = storiface.FTUpdateCache
+		case "update":
+			ft = storiface.FTUpdate
+		default:
+			return xerrors.Errorf("invalid file type")
+		}
+
+		ctx := lcli.ReqContext(cctx)
+		api, closer, err := lcli.GetStorageMinerAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+
+		maddr, err := api.ActorAddress(ctx)
+		if err != nil {
+			return xerrors.Errorf("getting miner actor address: %w", err)
+		}
+
+		mid, err := address.IDFromAddress(maddr)
+		if err != nil {
+			return xerrors.Errorf("getting miner id: %w", err)
+		}
+
+		sid := abi.SectorID{
+			Miner:  abi.ActorID(mid),
+			Number: abi.SectorNumber(sectorNum),
+		}
+
+		// get remote store
+		sminfo, err := lcli.GetAPIInfo(cctx, repo.StorageMiner)
+		if err != nil {
+			return xerrors.Errorf("could not get api info: %w", err)
+		}
+
+		localStore, err := paths.NewLocal(ctx, &emptyLocalStorage{}, api, []string{})
+		if err != nil {
+			return err
+		}
+
+		if !cctx.Bool("really-do-it") {
+			return xerrors.Errorf("pass --really-do-it to actually perform the deletion")
+		}
+
+		remote := paths.NewRemote(localStore, api, sminfo.AuthHeader(), 10,
+			&paths.DefaultPartialFileHandler{})
+
+		err = remote.Remove(ctx, sid, ft, true, nil)
+		if err != nil {
+			return xerrors.Errorf("removing sector: %w", err)
+		}
+
+		return nil
+	},
+}
+
+var dumpSectorOnChainInfoCmd = &cli.Command{
+	Name:  "dump-sectors",
+	Usage: "Dump SectorOnChainInfo in CSV format for all sectors for all miners that have claimed power",
+	Action: func(cctx *cli.Context) error {
+		ctx := lcli.ReqContext(cctx)
+
+		h, err := loadChainStore(ctx, cctx.String("repo"))
+		if err != nil {
+			return xerrors.Errorf("loading chainstore: %w", err)
+		}
+		defer h.closer()
+
+		ts, err := lcli.LoadTipSet(ctx, cctx, &ChainStoreTipSetResolver{Chain: h.cs})
+		if err != nil {
+			return xerrors.Errorf("loading tipset: %w", err)
+		}
+
+		powerActor, err := h.sm.LoadActor(ctx, power.Address, ts)
+		if err != nil {
+			return xerrors.Errorf("failed to load power actor: %w", err)
+		}
+
+		powerState, err := power.Load(h.cs.ActorStore(ctx), powerActor)
+		if err != nil {
+			return xerrors.Errorf("failed to load power actor state: %w", err)
+		}
+
+		_, _ = fmt.Fprintf(cctx.App.Writer,
+			"Miner,SectorNumber,SealProof,DealIDCount,Activation,Expiration,DealWeight,VerifiedDealWeight,"+
+				"InitialPledge,ExpectedDayReward,ExpectedStoragePledge,PowerBaseEpoch,Flags\n")
+
+		var count int
+		err = powerState.ForEachClaim(func(maddr address.Address, claim power.Claim) error {
+			act, err := h.sm.LoadActorTsk(ctx, maddr, ts.Key())
+			if err != nil {
+				return xerrors.Errorf("failed to load miner actor: %w", err)
+			}
+
+			mas, err := miner.Load(h.sm.ChainStore().ActorStore(ctx), act)
+			if err != nil {
+				return xerrors.Errorf("failed to load miner actor state: %w", err)
+			}
+
+			soci, err := mas.LoadSectors(nil)
+			if err != nil {
+				return xerrors.Errorf("load sectors: %w", err)
+			}
+
+			for _, sector := range soci {
+				_, _ = fmt.Fprintf(
+					cctx.App.Writer,
+					"%s,%d,%d,%d,%d,%d,%s,%s,%s,%s,%s,%d,%x\n",
+					maddr,
+					sector.SectorNumber,
+					sector.SealProof,
+					len(sector.DealIDs),
+					sector.Activation,
+					sector.Expiration,
+					sector.DealWeight,
+					sector.VerifiedDealWeight,
+					sector.InitialPledge,
+					sector.ExpectedDayReward,
+					sector.ExpectedStoragePledge,
+					sector.PowerBaseEpoch,
+					sector.Flags,
+				)
+			}
+
+			count++
+			if count%1000 == 0 {
+				_, _ = fmt.Fprintf(cctx.App.ErrWriter, "Processed %d miners.\n", count)
+			}
+
+			return nil
+		}, false)
+
+		if err != nil {
+			return xerrors.Errorf("iterating over claims: %w", err)
+		}
+
+		_, _ = fmt.Fprintf(cctx.App.ErrWriter, "Processed %d miners. Complete.\n", count)
+
+		return nil
+	},
+}
+
+type emptyLocalStorage struct {
+}
+
+func (e *emptyLocalStorage) GetStorage() (storiface.StorageConfig, error) {
+	return storiface.StorageConfig{}, nil
+}
+
+func (e *emptyLocalStorage) SetStorage(f func(*storiface.StorageConfig)) error {
+	panic("don't call")
+}
+
+func (e *emptyLocalStorage) Stat(path string) (fsutil.FsStat, error) {
+	panic("don't call")
+}
+
+func (e *emptyLocalStorage) DiskUsage(path string) (int64, error) {
+	panic("don't call")
+}
+
+var _ paths.LocalStorage = &emptyLocalStorage{}

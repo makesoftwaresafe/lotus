@@ -3,24 +3,21 @@ package mock
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"math/rand"
 	"sync"
 
 	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
 	"golang.org/x/xerrors"
 
-	"github.com/filecoin-project/dagstore/mount"
-	commpffi "github.com/filecoin-project/go-commp-utils/ffiwrapper"
+	"github.com/filecoin-project/go-commp-utils/v2"
 	commcid "github.com/filecoin-project/go-fil-commcid"
 	"github.com/filecoin-project/go-state-types/abi"
 	prooftypes "github.com/filecoin-project/go-state-types/proof"
 
-	"github.com/filecoin-project/lotus/storage/sealer/ffiwrapper"
 	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
@@ -89,7 +86,7 @@ func (mgr *SectorMgr) AddPiece(ctx context.Context, sectorID storiface.SectorRef
 	var b bytes.Buffer
 	tr := io.TeeReader(r, &b)
 
-	c, err := commpffi.GeneratePieceCIDFromFile(sectorID.ProofType, tr, size)
+	c, err := commp.GeneratePieceCIDFromFile(sectorID.ProofType, tr, size)
 	if err != nil {
 		return abi.PieceInfo{}, xerrors.Errorf("failed to generate piece cid: %w", err)
 	}
@@ -350,10 +347,15 @@ func (mgr *SectorMgr) GenerateWinningPoSt(ctx context.Context, minerID abi.Actor
 		}
 	}
 
-	return generateFakePoSt(sectorInfo, abi.RegisteredSealProof.RegisteredWinningPoStProof, randomness), nil
+	ppt, err := sectorInfo[0].SealProof.RegisteredWinningPoStProof()
+	if err != nil {
+		panic(err)
+	}
+
+	return generateFakePoSt(sectorInfo, ppt, randomness), nil
 }
 
-func (mgr *SectorMgr) GenerateWindowPoSt(ctx context.Context, minerID abi.ActorID, xSectorInfo []prooftypes.ExtendedSectorInfo, randomness abi.PoStRandomness) ([]prooftypes.PoStProof, []abi.SectorID, error) {
+func (mgr *SectorMgr) GenerateWindowPoSt(ctx context.Context, minerID abi.ActorID, ppt abi.RegisteredPoStProof, xSectorInfo []prooftypes.ExtendedSectorInfo, randomness abi.PoStRandomness) ([]prooftypes.PoStProof, []abi.SectorID, error) {
 	mgr.lk.Lock()
 	defer mgr.lk.Unlock()
 
@@ -396,7 +398,7 @@ func (mgr *SectorMgr) GenerateWindowPoSt(ctx context.Context, minerID abi.ActorI
 		}
 	}
 
-	return generateFakePoSt(sectorInfo, abi.RegisteredSealProof.RegisteredWindowPoStProof, randomness), skipped, nil
+	return generateFakePoSt(sectorInfo, ppt, randomness), skipped, nil
 }
 
 func generateFakePoStProof(sectorInfo []prooftypes.SectorInfo, randomness abi.PoStRandomness) []byte {
@@ -414,15 +416,10 @@ func generateFakePoStProof(sectorInfo []prooftypes.SectorInfo, randomness abi.Po
 
 }
 
-func generateFakePoSt(sectorInfo []prooftypes.SectorInfo, rpt func(abi.RegisteredSealProof) (abi.RegisteredPoStProof, error), randomness abi.PoStRandomness) []prooftypes.PoStProof {
-	wp, err := rpt(sectorInfo[0].SealProof)
-	if err != nil {
-		panic(err)
-	}
-
+func generateFakePoSt(sectorInfo []prooftypes.SectorInfo, ppt abi.RegisteredPoStProof, randomness abi.PoStRandomness) []prooftypes.PoStProof {
 	return []prooftypes.PoStProof{
 		{
-			PoStProof:  wp,
+			PoStProof:  ppt,
 			ProofBytes: generateFakePoStProof(sectorInfo, randomness),
 		},
 	}
@@ -436,9 +433,12 @@ func (mgr *SectorMgr) GenerateWindowPoStWithVanilla(ctx context.Context, proofTy
 	panic("implement me")
 }
 
-func (mgr *SectorMgr) ReadPiece(ctx context.Context, sector storiface.SectorRef, offset storiface.UnpaddedByteIndex, size abi.UnpaddedPieceSize, ticket abi.SealRandomness, unsealed cid.Cid) (mount.Reader, bool, error) {
+func (mgr *SectorMgr) ReadPiece(ctx context.Context, sector storiface.SectorRef, offset storiface.UnpaddedByteIndex, size abi.UnpaddedPieceSize, ticket abi.SealRandomness, unsealed cid.Cid) (storiface.Reader, bool, error) {
 	off := storiface.UnpaddedByteIndex(0)
 	var piece cid.Cid
+
+	mgr.lk.Lock()
+
 	for _, c := range mgr.sectors[sector.ID].pieces {
 		piece = c
 		if off >= offset {
@@ -451,12 +451,14 @@ func (mgr *SectorMgr) ReadPiece(ctx context.Context, sector storiface.SectorRef,
 	}
 	br := bytes.NewReader(mgr.pieces[piece][:size])
 
+	mgr.lk.Unlock()
+
 	return struct {
 		io.ReadCloser
 		io.Seeker
 		io.ReaderAt
 	}{
-		ReadCloser: ioutil.NopCloser(br),
+		ReadCloser: io.NopCloser(br),
 		Seeker:     br,
 		ReaderAt:   br,
 	}, false, nil
@@ -474,7 +476,7 @@ func (mgr *SectorMgr) StageFakeData(mid abi.ActorID, spt abi.RegisteredSealProof
 	}
 
 	buf := make([]byte, usize)
-	_, _ = rand.Read(buf) // nolint:gosec
+	_, _ = rand.Reader.Read(buf)
 
 	id := storiface.SectorRef{
 		ID: abi.SectorID{
@@ -492,15 +494,15 @@ func (mgr *SectorMgr) StageFakeData(mid abi.ActorID, spt abi.RegisteredSealProof
 	return id, []abi.PieceInfo{pi}, nil
 }
 
-func (mgr *SectorMgr) FinalizeSector(context.Context, storiface.SectorRef, []storiface.Range) error {
+func (mgr *SectorMgr) FinalizeSector(context.Context, storiface.SectorRef) error {
 	return nil
 }
 
-func (mgr *SectorMgr) FinalizeReplicaUpdate(context.Context, storiface.SectorRef, []storiface.Range) error {
+func (mgr *SectorMgr) FinalizeReplicaUpdate(context.Context, storiface.SectorRef) error {
 	return nil
 }
 
-func (mgr *SectorMgr) ReleaseUnsealed(ctx context.Context, sector storiface.SectorRef, safeToFree []storiface.Range) error {
+func (mgr *SectorMgr) ReleaseUnsealed(ctx context.Context, sector storiface.SectorRef, keepUnsealed []storiface.Range) error {
 	return nil
 }
 
@@ -510,6 +512,10 @@ func (mgr *SectorMgr) ReleaseReplicaUpgrade(ctx context.Context, sector storifac
 
 func (mgr *SectorMgr) ReleaseSectorKey(ctx context.Context, sector storiface.SectorRef) error {
 	return nil
+}
+
+func (mgr *SectorMgr) DownloadSectorData(ctx context.Context, sector storiface.SectorRef, finalized bool, src map[storiface.SectorFileType]storiface.SectorLocation) error {
+	return xerrors.Errorf("not supported")
 }
 
 func (mgr *SectorMgr) Remove(ctx context.Context, sector storiface.SectorRef) error {
@@ -605,6 +611,10 @@ func (mgr *SectorMgr) ReturnGenerateSectorKeyFromData(ctx context.Context, callI
 }
 
 func (mgr *SectorMgr) ReturnFinalizeReplicaUpdate(ctx context.Context, callID storiface.CallID, err *storiface.CallError) error {
+	panic("not supported")
+}
+
+func (mgr *SectorMgr) ReturnDownloadSector(ctx context.Context, callID storiface.CallID, err *storiface.CallError) error {
 	panic("not supported")
 }
 
@@ -721,7 +731,8 @@ func (m mockVerifProver) VerifyWindowPoSt(ctx context.Context, info prooftypes.W
 }
 
 func (m mockVerifProver) GenerateDataCommitment(pt abi.RegisteredSealProof, pieces []abi.PieceInfo) (cid.Cid, error) {
-	return ffiwrapper.GenerateUnsealedCID(pt, pieces)
+	pcid, _, err := commp.PieceAggregateCommP(pt, pieces)
+	return pcid, err
 }
 
 func (m mockVerifProver) GenerateWinningPoStSectorChallenge(ctx context.Context, proofType abi.RegisteredPoStProof, minerID abi.ActorID, randomness abi.PoStRandomness, eligibleSectorCount uint64) ([]uint64, error) {

@@ -174,8 +174,8 @@ var staterootStatCmd = &cli.Command{
 		}
 
 		outcap := 10
-		if cctx.Args().Len() > outcap {
-			outcap = cctx.Args().Len()
+		if cctx.NArg() > outcap {
+			outcap = cctx.NArg()
 		}
 		if len(infos) < outcap {
 			outcap = len(infos)
@@ -197,7 +197,7 @@ var staterootStatCmd = &cli.Command{
 				return err
 			}
 
-			fmt.Printf("%s\t%s\t%d\n", inf.Addr, string(cmh.Digest), inf.Stat.Size)
+			fmt.Printf("%s\t%x\t%d\n", inf.Addr, cmh.Digest, inf.Stat.Size)
 		}
 		return nil
 	},

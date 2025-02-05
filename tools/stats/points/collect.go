@@ -8,18 +8,18 @@ import (
 	"strings"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru/v2"
 	client "github.com/influxdata/influxdb1-client/v2"
 	"github.com/ipfs/go-cid"
-	"github.com/multiformats/go-multihash"
 	"go.opencensus.io/stats"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
 
 	"github.com/filecoin-project/lotus/api"
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
+	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/power"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/reward"
 	"github.com/filecoin-project/lotus/chain/store"
@@ -41,11 +41,11 @@ type ChainPointCollector struct {
 	ctx              context.Context
 	api              LotusApi
 	store            adt.Store
-	actorDigestCache *lru.TwoQueueCache
+	actorDigestCache *lru.TwoQueueCache[address.Address, string]
 }
 
 func NewChainPointCollector(ctx context.Context, store adt.Store, api LotusApi) (*ChainPointCollector, error) {
-	actorDigestCache, err := lru.New2Q(2 << 15)
+	actorDigestCache, err := lru.New2Q[address.Address, string](2 << 15)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +62,7 @@ func NewChainPointCollector(ctx context.Context, store adt.Store, api LotusApi) 
 
 func (c *ChainPointCollector) actorDigest(ctx context.Context, addr address.Address, tipset *types.TipSet) (string, error) {
 	if code, ok := c.actorDigestCache.Get(addr); ok {
-		return code.(string), nil
+		return code, nil
 	}
 
 	actor, err := c.api.StateGetActor(ctx, addr, tipset.Key())
@@ -70,12 +70,8 @@ func (c *ChainPointCollector) actorDigest(ctx context.Context, addr address.Addr
 		return "", err
 	}
 
-	dm, err := multihash.Decode(actor.Code.Hash())
-	if err != nil {
-		return "", err
-	}
+	digest := builtin.ActorNameByCode(actor.Code)
 
-	digest := string(dm.Digest)
 	c.actorDigestCache.Add(addr, digest)
 
 	return digest, nil
@@ -85,7 +81,7 @@ func (c *ChainPointCollector) Collect(ctx context.Context, tipset *types.TipSet)
 	start := time.Now()
 	done := metrics.Timer(ctx, metrics.TipsetCollectionDuration)
 	defer func() {
-		log.Infow("record tipset", "elapsed", time.Now().Sub(start).Seconds())
+		log.Infow("record tipset", "elapsed", time.Since(start).Seconds())
 		done()
 	}()
 
@@ -130,7 +126,7 @@ func (c *ChainPointCollector) collectBlockheaderPoints(ctx context.Context, pl *
 	start := time.Now()
 	done := metrics.Timer(ctx, metrics.TipsetCollectionBlockHeaderDuration)
 	defer func() {
-		log.Infow("collect blockheader points", "elapsed", time.Now().Sub(start).Seconds())
+		log.Infow("collect blockheader points", "elapsed", time.Since(start).Seconds())
 		done()
 	}()
 
@@ -195,7 +191,7 @@ func (c *ChainPointCollector) collectBlockheaderPoints(ctx context.Context, pl *
 		baseFeeIn := tipset.Blocks()[0].ParentBaseFee
 		newBaseFee := store.ComputeNextBaseFee(baseFeeIn, totalUniqGasLimit, len(tipset.Blocks()), tipset.Height())
 
-		baseFeeRat := new(big.Rat).SetFrac(newBaseFee.Int, new(big.Int).SetUint64(build.FilecoinPrecision))
+		baseFeeRat := new(big.Rat).SetFrac(newBaseFee.Int, new(big.Int).SetUint64(buildconstants.FilecoinPrecision))
 		baseFeeFloat, _ := baseFeeRat.Float64()
 		p = influx.NewPoint("chain.basefee", baseFeeFloat)
 		pl.AddPoint(p)
@@ -207,11 +203,11 @@ func (c *ChainPointCollector) collectBlockheaderPoints(ctx context.Context, pl *
 	}
 	{
 		blks := int64(len(cids))
-		p = influx.NewPoint("chain.gas_fill_ratio", float64(totalGasLimit)/float64(blks*build.BlockGasTarget))
+		p = influx.NewPoint("chain.gas_fill_ratio", float64(totalGasLimit)/float64(blks*buildconstants.BlockGasTarget))
 		pl.AddPoint(p)
-		p = influx.NewPoint("chain.gas_capacity_ratio", float64(totalUniqGasLimit)/float64(blks*build.BlockGasTarget))
+		p = influx.NewPoint("chain.gas_capacity_ratio", float64(totalUniqGasLimit)/float64(blks*buildconstants.BlockGasTarget))
 		pl.AddPoint(p)
-		p = influx.NewPoint("chain.gas_waste_ratio", float64(totalGasLimit-totalUniqGasLimit)/float64(blks*build.BlockGasTarget))
+		p = influx.NewPoint("chain.gas_waste_ratio", float64(totalGasLimit-totalUniqGasLimit)/float64(blks*buildconstants.BlockGasTarget))
 		pl.AddPoint(p)
 	}
 
@@ -222,11 +218,11 @@ func (c *ChainPointCollector) collectStaterootPoints(ctx context.Context, pl *in
 	start := time.Now()
 	done := metrics.Timer(ctx, metrics.TipsetCollectionStaterootDuration)
 	defer func() {
-		log.Infow("collect stateroot points", "elapsed", time.Now().Sub(start).Seconds())
+		log.Infow("collect stateroot points", "elapsed", time.Since(start).Seconds())
 		done()
 	}()
 
-	attoFil := types.NewInt(build.FilecoinPrecision).Int
+	attoFil := types.NewInt(buildconstants.FilecoinPrecision).Int
 
 	netBal, err := c.api.WalletBalance(ctx, reward.Address)
 	if err != nil {
@@ -271,7 +267,7 @@ func (c *ChainPointCollector) collectStaterootPoints(ctx context.Context, pl *in
 		pl.AddPoint(p)
 
 		return nil
-	})
+	}, false)
 }
 
 type msgTag struct {
@@ -284,7 +280,7 @@ func (c *ChainPointCollector) collectMessagePoints(ctx context.Context, pl *infl
 	start := time.Now()
 	done := metrics.Timer(ctx, metrics.TipsetCollectionMessageDuration)
 	defer func() {
-		log.Infow("collect message points", "elapsed", time.Now().Sub(start).Seconds())
+		log.Infow("collect message points", "elapsed", time.Since(start).Seconds())
 		done()
 	}()
 

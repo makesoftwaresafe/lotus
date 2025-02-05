@@ -3,8 +3,8 @@ package sealer
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
-	"math/rand"
+	"crypto/rand"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -21,16 +21,17 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-statestore"
 
+	"github.com/filecoin-project/lotus/node/config"
 	"github.com/filecoin-project/lotus/storage/paths"
 	"github.com/filecoin-project/lotus/storage/sealer/sealtasks"
 	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
-// TestPieceProviderReadPiece verifies that the ReadPiece method works correctly
+// TestPieceProviderSimpleNoRemoteWorker verifies that the ReadPiece method works correctly
 // only uses miner and does NOT use any remote worker.
 func TestPieceProviderSimpleNoRemoteWorker(t *testing.T) {
 	// Set up sector storage manager
-	sealerCfg := Config{
+	sealerCfg := config.SealerConfig{
 		ParallelFetchLimit: 10,
 		AllowAddPiece:      true,
 		AllowPreCommit1:    true,
@@ -89,7 +90,7 @@ func TestReadPieceRemoteWorkers(t *testing.T) {
 	logging.SetAllLoggers(logging.LevelDebug)
 
 	// miner's worker can only add pieces to an unsealed sector.
-	sealerCfg := Config{
+	sealerCfg := config.SealerConfig{
 		ParallelFetchLimit: 10,
 		AllowAddPiece:      true,
 		AllowPreCommit1:    false,
@@ -106,7 +107,7 @@ func TestReadPieceRemoteWorkers(t *testing.T) {
 	// the unsealed file from the miner.
 	ppt.addRemoteWorker(t, []sealtasks.TaskType{
 		sealtasks.TTPreCommit1, sealtasks.TTPreCommit2, sealtasks.TTCommit1,
-		sealtasks.TTFetch, sealtasks.TTFinalize,
+		sealtasks.TTFetch, sealtasks.TTFinalize, sealtasks.TTFinalizeUnsealed,
 	})
 
 	// create a worker that can ONLY unseal and fetch
@@ -179,7 +180,7 @@ func TestReadPieceRemoteWorkers(t *testing.T) {
 
 type pieceProviderTestHarness struct {
 	ctx         context.Context
-	index       *paths.Index
+	index       *paths.MemIndex
 	pp          PieceProvider
 	sector      storiface.SectorRef
 	mgr         *Manager
@@ -194,11 +195,14 @@ type pieceProviderTestHarness struct {
 
 func generatePieceData(size uint64) []byte {
 	bz := make([]byte, size)
-	rand.Read(bz)
+	_, err := rand.Read(bz)
+	if err != nil {
+		panic(err)
+	}
 	return bz
 }
 
-func newPieceProviderTestHarness(t *testing.T, mgrConfig Config, sectorProofType abi.RegisteredSealProof) *pieceProviderTestHarness {
+func newPieceProviderTestHarness(t *testing.T, mgrConfig config.SealerConfig, sectorProofType abi.RegisteredSealProof) *pieceProviderTestHarness {
 	ctx := context.Background()
 	// listen on tcp socket to create an http server later
 	address := "0.0.0.0:0"
@@ -206,7 +210,7 @@ func newPieceProviderTestHarness(t *testing.T, mgrConfig Config, sectorProofType
 	require.NoError(t, err)
 
 	// create index, storage, local store & remote store.
-	index := paths.NewIndex()
+	index := paths.NewMemIndex(nil)
 	storage := newTestStorage(t)
 	localStore, err := paths.NewLocal(ctx, storage, index, []string{"http://" + nl.Addr().String() + "/remote"})
 	require.NoError(t, err)
@@ -217,7 +221,7 @@ func newPieceProviderTestHarness(t *testing.T, mgrConfig Config, sectorProofType
 	wsts := statestore.New(namespace.Wrap(dstore, datastore.NewKey("/worker/calls")))
 	smsts := statestore.New(namespace.Wrap(dstore, datastore.NewKey("/stmgr/calls")))
 
-	mgr, err := New(ctx, localStore, remoteStore, storage, index, mgrConfig, wsts, smsts)
+	mgr, err := New(ctx, localStore, remoteStore, storage, index, mgrConfig, config.ProvingConfig{}, wsts, smsts)
 	require.NoError(t, err)
 
 	// start a http server on the manager to serve sector file requests.
@@ -285,7 +289,7 @@ func (p *pieceProviderTestHarness) addRemoteWorker(t *testing.T, tasks []sealtas
 	dstore := ds_sync.MutexWrap(datastore.NewMapDatastore())
 	csts := statestore.New(namespace.Wrap(dstore, datastore.NewKey("/stmgr/calls")))
 
-	worker := newLocalWorker(nil, WorkerConfig{
+	worker := NewLocalWorkerWithExecutor(nil, WorkerConfig{
 		TaskTypes: tasks,
 	}, os.LookupEnv, remote, localStore, p.index, p.mgr, csts)
 
@@ -345,13 +349,14 @@ func (p *pieceProviderTestHarness) readPiece(t *testing.T, offset storiface.Unpa
 	defer func() { _ = rd.Close() }()
 
 	// Make sure the input matches the output
-	readData, err := ioutil.ReadAll(rd)
+	readData, err := io.ReadAll(rd)
 	require.NoError(t, err)
 	require.Equal(t, expectedBytes, readData)
 }
 
 func (p *pieceProviderTestHarness) finalizeSector(t *testing.T, keepUnseal []storiface.Range) {
-	require.NoError(t, p.mgr.FinalizeSector(p.ctx, p.sector, keepUnseal))
+	require.NoError(t, p.mgr.ReleaseUnsealed(p.ctx, p.sector, keepUnseal))
+	require.NoError(t, p.mgr.FinalizeSector(p.ctx, p.sector))
 }
 
 func (p *pieceProviderTestHarness) shutdown(t *testing.T) {

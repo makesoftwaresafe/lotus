@@ -3,7 +3,6 @@ package paths
 import (
 	"context"
 	"encoding/json"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -19,18 +18,18 @@ const pathSize = 16 << 20
 
 type TestingLocalStorage struct {
 	root string
-	c    StorageConfig
+	c    storiface.StorageConfig
 }
 
 func (t *TestingLocalStorage) DiskUsage(path string) (int64, error) {
 	return 1, nil
 }
 
-func (t *TestingLocalStorage) GetStorage() (StorageConfig, error) {
+func (t *TestingLocalStorage) GetStorage() (storiface.StorageConfig, error) {
 	return t.c, nil
 }
 
-func (t *TestingLocalStorage) SetStorage(f func(*StorageConfig)) error {
+func (t *TestingLocalStorage) SetStorage(f func(*storiface.StorageConfig)) error {
 	f(&t.c)
 	return nil
 }
@@ -51,7 +50,7 @@ func (t *TestingLocalStorage) init(subpath string) error {
 
 	metaFile := filepath.Join(path, MetaFile)
 
-	meta := &LocalStorageMeta{
+	meta := &storiface.LocalStorageMeta{
 		ID:       storiface.ID(uuid.New().String()),
 		Weight:   1,
 		CanSeal:  true,
@@ -63,7 +62,7 @@ func (t *TestingLocalStorage) init(subpath string) error {
 		return err
 	}
 
-	if err := ioutil.WriteFile(metaFile, mb, 0644); err != nil {
+	if err := os.WriteFile(metaFile, mb, 0644); err != nil {
 		return err
 	}
 
@@ -81,7 +80,7 @@ func TestLocalStorage(t *testing.T) {
 		root: root,
 	}
 
-	index := NewIndex()
+	index := NewMemIndex(nil)
 
 	st, err := NewLocal(ctx, tstor, index, nil)
 	require.NoError(t, err)

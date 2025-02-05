@@ -16,7 +16,7 @@ import (
 	"github.com/filecoin-project/go-state-types/big"
 
 	lapi "github.com/filecoin-project/lotus/api"
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/messagepool"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/node/config"
@@ -404,7 +404,7 @@ var MpoolReplaceCmd = &cli.Command{
 
 		var from address.Address
 		var nonce uint64
-		switch cctx.Args().Len() {
+		switch cctx.NArg() {
 		case 1:
 			mcid, err := cid.Decode(cctx.Args().First())
 			if err != nil {
@@ -461,7 +461,12 @@ var MpoolReplaceCmd = &cli.Command{
 		msg := found.Message
 
 		if cctx.Bool("auto") {
-			minRBF := messagepool.ComputeMinRBF(msg.GasPremium)
+			cfg, err := api.MpoolGetConfig(ctx)
+			if err != nil {
+				return xerrors.Errorf("failed to lookup the message pool config: %w", err)
+			}
+
+			defaultRBF := messagepool.ComputeRBF(msg.GasPremium, cfg.ReplaceByFeeRatio)
 
 			var mss *lapi.MessageSendSpec
 			if cctx.IsSet("fee-limit") {
@@ -482,11 +487,11 @@ var MpoolReplaceCmd = &cli.Command{
 				return xerrors.Errorf("failed to estimate gas values: %w", err)
 			}
 
-			msg.GasPremium = big.Max(retm.GasPremium, minRBF)
+			msg.GasPremium = big.Max(retm.GasPremium, defaultRBF)
 			msg.GasFeeCap = big.Max(retm.GasFeeCap, msg.GasPremium)
 
 			mff := func() (abi.TokenAmount, error) {
-				return abi.TokenAmount(config.DefaultDefaultMaxFee), nil
+				return abi.TokenAmount(config.DefaultDefaultMaxFee()), nil
 			}
 
 			messagepool.CapGasFee(mff, &msg, mss)
@@ -610,8 +615,8 @@ var MpoolConfig = &cli.Command{
 	Usage:     "get or set current mpool configuration",
 	ArgsUsage: "[new-config]",
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() > 1 {
-			return cli.ShowCommandHelp(cctx, cctx.Command.Name)
+		if cctx.NArg() > 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		afmt := NewAppFmt(cctx.App)
@@ -624,7 +629,7 @@ var MpoolConfig = &cli.Command{
 
 		ctx := ReqContext(cctx)
 
-		if cctx.Args().Len() == 0 {
+		if cctx.NArg() == 0 {
 			cfg, err := api.MpoolGetConfig(ctx)
 			if err != nil {
 				return err
@@ -707,7 +712,7 @@ var MpoolGasPerfCmd = &cli.Command{
 
 		baseFee := ts.Blocks()[0].ParentBaseFee
 
-		bigBlockGasLimit := big.NewInt(build.BlockGasLimit)
+		bigBlockGasLimit := big.NewInt(buildconstants.BlockGasLimit)
 
 		getGasReward := func(msg *types.SignedMessage) big.Int {
 			maxPremium := types.BigSub(msg.Message.GasFeeCap, baseFee)
@@ -718,7 +723,7 @@ var MpoolGasPerfCmd = &cli.Command{
 		}
 
 		getGasPerf := func(gasReward big.Int, gasLimit int64) float64 {
-			// gasPerf = gasReward * build.BlockGasLimit / gasLimit
+			// gasPerf = gasReward * buildconstants.BlockGasLimit / gasLimit
 			a := new(stdbig.Rat).SetInt(new(stdbig.Int).Mul(gasReward.Int, bigBlockGasLimit.Int))
 			b := stdbig.NewRat(1, gasLimit)
 			c := new(stdbig.Rat).Mul(a, b)

@@ -9,14 +9,14 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
 	"github.com/filecoin-project/go-state-types/network"
 
-	"github.com/filecoin-project/lotus/build"
-	"github.com/filecoin-project/lotus/chain/actors"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
 	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/account"
-	"github.com/filecoin-project/lotus/chain/consensus/filcns"
+	"github.com/filecoin-project/lotus/chain/consensus"
 	lrand "github.com/filecoin-project/lotus/chain/rand"
 	"github.com/filecoin-project/lotus/chain/state"
 	"github.com/filecoin-project/lotus/chain/stmgr"
@@ -31,11 +31,12 @@ const (
 	// has.
 	// 5 per tipset, but we effectively get 4 blocks worth of messages.
 	expectedBlocks = 4
-	// TODO: This will produce invalid blocks but it will accurately model the amount of gas
-	// we're willing to use per-tipset.
-	// A more correct approach would be to produce 5 blocks. We can do that later.
-	targetGas = build.BlockGasTarget * expectedBlocks
 )
+
+// TODO: This will produce invalid blocks but it will accurately model the amount of gas
+// we're willing to use per-tipset.
+// A more correct approach would be to produce 5 blocks. We can do that later.
+var targetGas = buildconstants.BlockGasTarget * expectedBlocks
 
 type BlockBuilder struct {
 	ctx    context.Context
@@ -84,7 +85,7 @@ func NewBlockBuilder(ctx context.Context, logger *zap.SugaredLogger, sm *stmgr.S
 		Epoch:          parentTs.Height() + 1,
 		Rand:           r,
 		Bstore:         sm.ChainStore().StateBlockstore(),
-		Actors:         filcns.NewActorRegistry(),
+		Actors:         consensus.NewActorRegistry(),
 		Syscalls:       sm.VMSys(),
 		CircSupplyCalc: sm.GetVMCirculatingSupply,
 		NetworkVersion: sm.GetNetworkVersion(ctx, parentTs.Height()+1),
@@ -98,7 +99,7 @@ func NewBlockBuilder(ctx context.Context, logger *zap.SugaredLogger, sm *stmgr.S
 	return bb, nil
 }
 
-// PushMessages tries to push the specified message into the block.
+// PushMessage tries to push the specified message into the block.
 //
 // 1. All messages will be executed in-order.
 // 2. Gas computation & nonce selection will be handled internally.
@@ -149,7 +150,7 @@ func (bb *BlockBuilder) PushMessage(msg *types.Message) (*types.MessageReceipt, 
 	}
 	msg.GasPremium = abi.NewTokenAmount(0)
 	msg.GasFeeCap = abi.NewTokenAmount(0)
-	msg.GasLimit = build.BlockGasTarget
+	msg.GasLimit = buildconstants.BlockGasTarget
 
 	// We manually snapshot so we can revert nonce changes, etc. on failure.
 	err = st.Snapshot(bb.ctx)
@@ -273,8 +274,8 @@ func (bb *BlockBuilder) StateManager() *stmgr.StateManager {
 }
 
 // ActorsVersion returns the actors version for the target block.
-func (bb *BlockBuilder) ActorsVersion() (actors.Version, error) {
-	return actors.VersionForNetwork(bb.NetworkVersion())
+func (bb *BlockBuilder) ActorsVersion() (actorstypes.Version, error) {
+	return actorstypes.VersionForNetwork(bb.NetworkVersion())
 }
 
 func (bb *BlockBuilder) L() *zap.SugaredLogger {

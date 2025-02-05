@@ -2,16 +2,20 @@ package power
 
 import (
 	"bytes"
+	"fmt"
 
 	"github.com/ipfs/go-cid"
 	cbg "github.com/whyrusleeping/cbor-gen"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+	"github.com/filecoin-project/go-state-types/manifest"
 	builtin5 "github.com/filecoin-project/specs-actors/v5/actors/builtin"
 	power5 "github.com/filecoin-project/specs-actors/v5/actors/builtin/power"
 	adt5 "github.com/filecoin-project/specs-actors/v5/actors/util/adt"
 
+	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
 	"github.com/filecoin-project/lotus/chain/actors/builtin"
 )
@@ -92,6 +96,14 @@ func (s *state5) MinerCounts() (uint64, uint64, error) {
 	return uint64(s.State.MinerAboveMinPowerCount), uint64(s.State.MinerCount), nil
 }
 
+func (s *state5) RampStartEpoch() int64 {
+	return 0
+}
+
+func (s *state5) RampDurationEpochs() uint64 {
+	return 0
+}
+
 func (s *state5) ListAllMiners() ([]address.Address, error) {
 	claims, err := s.claims()
 	if err != nil {
@@ -114,7 +126,7 @@ func (s *state5) ListAllMiners() ([]address.Address, error) {
 	return miners, nil
 }
 
-func (s *state5) ForEachClaim(cb func(miner address.Address, claim Claim) error) error {
+func (s *state5) ForEachClaim(cb func(miner address.Address, claim Claim) error, onlyEligible bool) error {
 	claims, err := s.claims()
 	if err != nil {
 		return err
@@ -126,10 +138,26 @@ func (s *state5) ForEachClaim(cb func(miner address.Address, claim Claim) error)
 		if err != nil {
 			return err
 		}
-		return cb(a, Claim{
-			RawBytePower:    claim.RawBytePower,
-			QualityAdjPower: claim.QualityAdjPower,
-		})
+		if !onlyEligible {
+			return cb(a, Claim{
+				RawBytePower:    claim.RawBytePower,
+				QualityAdjPower: claim.QualityAdjPower,
+			})
+		}
+
+		//slow path
+		eligible, err := s.State.MinerNominalPowerMeetsConsensusMinimum(s.store, a)
+
+		if err != nil {
+			return fmt.Errorf("checking consensus minimums: %w", err)
+		}
+		if eligible {
+			return cb(a, Claim{
+				RawBytePower:    claim.RawBytePower,
+				QualityAdjPower: claim.QualityAdjPower,
+			})
+		}
+		return nil
 	})
 }
 
@@ -183,4 +211,21 @@ func fromV5Claim(v5 power5.Claim) Claim {
 		RawBytePower:    v5.RawBytePower,
 		QualityAdjPower: v5.QualityAdjPower,
 	}
+}
+
+func (s *state5) ActorKey() string {
+	return manifest.PowerKey
+}
+
+func (s *state5) ActorVersion() actorstypes.Version {
+	return actorstypes.Version5
+}
+
+func (s *state5) Code() cid.Cid {
+	code, ok := actors.GetActorCodeID(s.ActorVersion(), s.ActorKey())
+	if !ok {
+		panic(fmt.Errorf("didn't find actor %v code id for actor version %d", s.ActorKey(), s.ActorVersion()))
+	}
+
+	return code
 }

@@ -1,52 +1,51 @@
 package sub
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
-	"sync"
+	"errors"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru/v2"
+	bserv "github.com/ipfs/boxo/blockservice"
 	blocks "github.com/ipfs/go-block-format"
-	bserv "github.com/ipfs/go-blockservice"
 	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
-	"github.com/libp2p/go-libp2p-core/connmgr"
-	"github.com/libp2p/go-libp2p-core/peer"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/connmgr"
+	"github.com/libp2p/go-libp2p/core/peer"
+	mh "github.com/multiformats/go-multihash"
 	"go.opencensus.io/stats"
 	"go.opencensus.io/tag"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/go-legs/dtsync"
 
 	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain"
 	"github.com/filecoin-project/lotus/chain/consensus"
 	"github.com/filecoin-project/lotus/chain/messagepool"
 	"github.com/filecoin-project/lotus/chain/store"
-	"github.com/filecoin-project/lotus/chain/sub/ratelimit"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/metrics"
-	"github.com/filecoin-project/lotus/node/impl/client"
-	"github.com/filecoin-project/lotus/node/impl/full"
 )
 
-var log = logging.Logger("sub")
+var (
+	log                 = logging.Logger("sub")
+	DefaultHashFunction = uint64(mh.BLAKE2B_MIN + 31)
+)
 
 var msgCidPrefix = cid.Prefix{
 	Version:  1,
 	Codec:    cid.DagCBOR,
-	MhType:   client.DefaultHashFunction,
+	MhType:   DefaultHashFunction,
 	MhLength: 32,
 }
 
 func HandleIncomingBlocks(ctx context.Context, bsub *pubsub.Subscription, s *chain.Syncer, bs bserv.BlockService, cmgr connmgr.ConnManager) {
 	// Timeout after (block time + propagation delay). This is useless at
 	// this point.
-	timeout := time.Duration(build.BlockDelaySecs+build.PropagationDelaySecs) * time.Second
+	timeout := time.Duration(buildconstants.BlockDelaySecs+buildconstants.PropagationDelaySecs) * time.Second
 
 	for {
 		msg, err := bsub.Next(ctx)
@@ -136,6 +135,7 @@ func FetchMessagesByCids(
 }
 
 // FIXME: Duplicate of above.
+
 func FetchSignedMessagesByCids(
 	ctx context.Context,
 	bserv bserv.BlockGetter,
@@ -159,16 +159,18 @@ func FetchSignedMessagesByCids(
 }
 
 // Fetch `cids` from the block service, apply `cb` on each of them. Used
-//  by the fetch message functions above.
+//
+//	by the fetch message functions above.
+//
 // We check that each block is received only once and we do not received
-//  blocks we did not request.
+//
+//	blocks we did not request.
 func fetchCids(
 	ctx context.Context,
 	bserv bserv.BlockGetter,
 	cids []cid.Cid,
 	cb func(int, blocks.Block) error,
 ) error {
-
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -214,7 +216,7 @@ func fetchCids(
 type BlockValidator struct {
 	self peer.ID
 
-	peers *lru.TwoQueueCache
+	peers *lru.TwoQueueCache[peer.ID, int]
 
 	killThresh int
 
@@ -228,7 +230,7 @@ type BlockValidator struct {
 }
 
 func NewBlockValidator(self peer.ID, chain *store.ChainStore, cns consensus.Consensus, blacklist func(peer.ID)) *BlockValidator {
-	p, _ := lru.New2Q(4096)
+	p, _ := lru.New2Q[peer.ID, int](4096)
 	return &BlockValidator{
 		self:       self,
 		peers:      p,
@@ -241,13 +243,11 @@ func NewBlockValidator(self peer.ID, chain *store.ChainStore, cns consensus.Cons
 }
 
 func (bv *BlockValidator) flagPeer(p peer.ID) {
-	v, ok := bv.peers.Get(p)
+	val, ok := bv.peers.Get(p)
 	if !ok {
-		bv.peers.Add(p, int(1))
+		bv.peers.Add(p, 1)
 		return
 	}
-
-	val := v.(int)
 
 	if val >= bv.killThresh {
 		log.Warnf("blacklisting peer %s", p)
@@ -255,7 +255,7 @@ func (bv *BlockValidator) flagPeer(p peer.ID) {
 		return
 	}
 
-	bv.peers.Add(p, v.(int)+1)
+	bv.peers.Add(p, val+1)
 }
 
 func (bv *BlockValidator) Validate(ctx context.Context, pid peer.ID, msg *pubsub.Message) (res pubsub.ValidationResult) {
@@ -270,7 +270,7 @@ func (bv *BlockValidator) Validate(ctx context.Context, pid peer.ID, msg *pubsub
 	}()
 
 	var what string
-	res, what = bv.consensus.ValidateBlockPubsub(ctx, pid == bv.self, msg)
+	res, what = consensus.ValidateBlockPubsub(ctx, bv.consensus, pid == bv.self, msg)
 	if res == pubsub.ValidationAccept {
 		// it's a good block! make sure we've only seen it once
 		if count := bv.recvBlocks.add(msg.ValidatorData.(*types.BlockMsg).Cid()); count > 0 {
@@ -290,11 +290,11 @@ func (bv *BlockValidator) Validate(ctx context.Context, pid peer.ID, msg *pubsub
 }
 
 type blockReceiptCache struct {
-	blocks *lru.TwoQueueCache
+	blocks *lru.TwoQueueCache[cid.Cid, int]
 }
 
 func newBlockReceiptCache() *blockReceiptCache {
-	c, _ := lru.New2Q(8192)
+	c, _ := lru.New2Q[cid.Cid, int](8192)
 
 	return &blockReceiptCache{
 		blocks: c,
@@ -304,12 +304,12 @@ func newBlockReceiptCache() *blockReceiptCache {
 func (brc *blockReceiptCache) add(bcid cid.Cid) int {
 	val, ok := brc.blocks.Get(bcid)
 	if !ok {
-		brc.blocks.Add(bcid, int(1))
+		brc.blocks.Add(bcid, 1)
 		return 0
 	}
 
-	brc.blocks.Add(bcid, val.(int)+1)
-	return val.(int)
+	brc.blocks.Add(bcid, val+1)
+	return val
 }
 
 type MessageValidator struct {
@@ -328,7 +328,7 @@ func (mv *MessageValidator) Validate(ctx context.Context, pid peer.ID, msg *pubs
 
 	start := time.Now()
 	defer func() {
-		ms := time.Now().Sub(start).Microseconds()
+		ms := time.Since(start).Microseconds()
 		stats.Record(ctx, metrics.MessageValidationDuration.M(float64(ms)/1000))
 	}()
 
@@ -349,16 +349,30 @@ func (mv *MessageValidator) Validate(ctx context.Context, pid peer.ID, msg *pubs
 		)
 		recordFailure(ctx, metrics.MessageValidationFailure, "add")
 		switch {
-		case xerrors.Is(err, messagepool.ErrSoftValidationFailure):
+
+		case errors.Is(err, messagepool.ErrSoftValidationFailure):
 			fallthrough
-		case xerrors.Is(err, messagepool.ErrRBFTooLowPremium):
+		case errors.Is(err, messagepool.ErrRBFTooLowPremium):
 			fallthrough
-		case xerrors.Is(err, messagepool.ErrTooManyPendingMessages):
+		case errors.Is(err, messagepool.ErrTooManyPendingMessages):
 			fallthrough
-		case xerrors.Is(err, messagepool.ErrNonceGap):
+		case errors.Is(err, messagepool.ErrNonceGap):
 			fallthrough
-		case xerrors.Is(err, messagepool.ErrNonceTooLow):
+		case errors.Is(err, messagepool.ErrGasFeeCapTooLow):
+			fallthrough
+		case errors.Is(err, messagepool.ErrNonceTooLow):
+			fallthrough
+		case errors.Is(err, messagepool.ErrNotEnoughFunds):
+			fallthrough
+		case errors.Is(err, messagepool.ErrExistingNonce):
 			return pubsub.ValidationIgnore
+
+		case errors.Is(err, messagepool.ErrMessageTooBig):
+			fallthrough
+		case errors.Is(err, messagepool.ErrMessageValueTooHigh):
+			fallthrough
+		case errors.Is(err, messagepool.ErrInvalidToAddr):
+			fallthrough
 		default:
 			return pubsub.ValidationReject
 		}
@@ -381,7 +395,7 @@ func (mv *MessageValidator) validateLocalMessage(ctx context.Context, msg *pubsu
 
 	start := time.Now()
 	defer func() {
-		ms := time.Now().Sub(start).Microseconds()
+		ms := time.Since(start).Microseconds()
 		stats.Record(ctx, metrics.MessageValidationDuration.M(float64(ms)/1000))
 	}()
 
@@ -450,169 +464,4 @@ func recordFailure(ctx context.Context, metric *stats.Int64Measure, failureType 
 		tag.Upsert(metrics.FailureType, failureType),
 	)
 	stats.Record(ctx, metric.M(1))
-}
-
-type peerMsgInfo struct {
-	peerID    peer.ID
-	lastCid   cid.Cid
-	lastSeqno uint64
-	rateLimit *ratelimit.Window
-	mutex     sync.Mutex
-}
-
-type IndexerMessageValidator struct {
-	self peer.ID
-
-	peerCache *lru.TwoQueueCache
-	chainApi  full.ChainModuleAPI
-	stateApi  full.StateModuleAPI
-}
-
-func NewIndexerMessageValidator(self peer.ID, chainApi full.ChainModuleAPI, stateApi full.StateModuleAPI) *IndexerMessageValidator {
-	peerCache, _ := lru.New2Q(8192)
-
-	return &IndexerMessageValidator{
-		self:      self,
-		peerCache: peerCache,
-		chainApi:  chainApi,
-		stateApi:  stateApi,
-	}
-}
-
-func (v *IndexerMessageValidator) Validate(ctx context.Context, pid peer.ID, msg *pubsub.Message) pubsub.ValidationResult {
-	// This chain-node should not be publishing its own messages.  These are
-	// relayed from market-nodes.  If a node appears to be local, reject it.
-	if pid == v.self {
-		log.Debug("ignoring indexer message from self")
-		stats.Record(ctx, metrics.IndexerMessageValidationFailure.M(1))
-		return pubsub.ValidationIgnore
-	}
-	originPeer := msg.GetFrom()
-	if originPeer == v.self {
-		log.Debug("ignoring indexer message originating from self")
-		stats.Record(ctx, metrics.IndexerMessageValidationFailure.M(1))
-		return pubsub.ValidationIgnore
-	}
-
-	idxrMsg := dtsync.Message{}
-	err := idxrMsg.UnmarshalCBOR(bytes.NewBuffer(msg.Data))
-	if err != nil {
-		log.Errorw("Could not decode indexer pubsub message", "err", err)
-		return pubsub.ValidationReject
-	}
-	if len(idxrMsg.ExtraData) == 0 {
-		log.Debugw("ignoring messsage missing miner id", "peer", originPeer)
-		return pubsub.ValidationIgnore
-	}
-
-	// Get miner info from lotus
-	minerAddr, err := address.NewFromBytes(idxrMsg.ExtraData)
-	if err != nil {
-		log.Warnw("cannot parse extra data as miner address", "err", err, "extraData", idxrMsg.ExtraData)
-		return pubsub.ValidationReject
-	}
-
-	minerID := minerAddr.String()
-	msgCid := idxrMsg.Cid
-
-	var msgInfo *peerMsgInfo
-	val, ok := v.peerCache.Get(minerID)
-	if !ok {
-		msgInfo = &peerMsgInfo{}
-	} else {
-		msgInfo = val.(*peerMsgInfo)
-	}
-
-	// Lock this peer's message info.
-	msgInfo.mutex.Lock()
-	defer msgInfo.mutex.Unlock()
-
-	if ok {
-		// Reject replayed messages.
-		seqno := binary.BigEndian.Uint64(msg.Message.GetSeqno())
-		if seqno <= msgInfo.lastSeqno {
-			log.Debugf("ignoring replayed indexer message")
-			return pubsub.ValidationIgnore
-		}
-		msgInfo.lastSeqno = seqno
-	}
-
-	if !ok || originPeer != msgInfo.peerID {
-		// Check that the miner ID maps to the peer that sent the message.
-		err = v.authenticateMessage(ctx, minerAddr, originPeer)
-		if err != nil {
-			log.Warnw("cannot authenticate messsage", "err", err, "peer", originPeer, "minerID", minerID)
-			stats.Record(ctx, metrics.IndexerMessageValidationFailure.M(1))
-			return pubsub.ValidationReject
-		}
-		msgInfo.peerID = originPeer
-		if !ok {
-			// Add msgInfo to cache only after being authenticated.  If two
-			// messages from the same peer are handled concurrently, there is a
-			// small chance that one msgInfo could replace the other here when
-			// the info is first cached.  This is OK, so no need to prevent it.
-			v.peerCache.Add(minerID, msgInfo)
-		}
-	}
-
-	// See if message needs to be ignored due to rate limiting.
-	if v.rateLimitPeer(msgInfo, msgCid) {
-		return pubsub.ValidationIgnore
-	}
-
-	stats.Record(ctx, metrics.IndexerMessageValidationSuccess.M(1))
-	return pubsub.ValidationAccept
-}
-
-func (v *IndexerMessageValidator) rateLimitPeer(msgInfo *peerMsgInfo, msgCid cid.Cid) bool {
-	const (
-		msgLimit        = 5
-		msgTimeLimit    = 10 * time.Second
-		repeatTimeLimit = 2 * time.Hour
-	)
-
-	timeWindow := msgInfo.rateLimit
-
-	// Check overall message rate.
-	if timeWindow == nil {
-		timeWindow = ratelimit.NewWindow(msgLimit, msgTimeLimit)
-		msgInfo.rateLimit = timeWindow
-	} else if msgInfo.lastCid == msgCid {
-		// Check if this is a repeat of the previous message data.
-		if time.Since(timeWindow.Newest()) < repeatTimeLimit {
-			log.Warnw("ignoring repeated indexer message", "sender", msgInfo.peerID)
-			return true
-		}
-	}
-
-	err := timeWindow.Add()
-	if err != nil {
-		log.Warnw("ignoring indexer message", "sender", msgInfo.peerID, "err", err)
-		return true
-	}
-
-	msgInfo.lastCid = msgCid
-
-	return false
-}
-
-func (v *IndexerMessageValidator) authenticateMessage(ctx context.Context, minerAddress address.Address, peerID peer.ID) error {
-	ts, err := v.chainApi.ChainHead(ctx)
-	if err != nil {
-		return err
-	}
-
-	minerInfo, err := v.stateApi.StateMinerInfo(ctx, minerAddress, ts.Key())
-	if err != nil {
-		return err
-	}
-
-	if minerInfo.PeerId == nil {
-		return xerrors.New("no peer id for miner")
-	}
-	if *minerInfo.PeerId != peerID {
-		return xerrors.New("miner id does not map to peer that sent message")
-	}
-
-	return nil
 }

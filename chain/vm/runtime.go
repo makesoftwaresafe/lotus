@@ -4,18 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
-	gruntime "runtime"
 	"time"
 
 	"github.com/ipfs/go-cid"
 	ipldcbor "github.com/ipfs/go-ipld-cbor"
 	"go.opencensus.io/trace"
-	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
 	"github.com/filecoin-project/go-state-types/cbor"
 	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/filecoin-project/go-state-types/exitcode"
@@ -33,6 +33,7 @@ import (
 	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/actors/aerrors"
 	"github.com/filecoin-project/lotus/chain/actors/builtin"
+	"github.com/filecoin-project/lotus/chain/rand"
 	"github.com/filecoin-project/lotus/chain/state"
 	"github.com/filecoin-project/lotus/chain/types"
 )
@@ -59,7 +60,9 @@ func (m *Message) ValueReceived() abi.TokenAmount {
 	return m.msg.Value
 }
 
-// EnableDetailedTracing, if true, outputs gas tracing in execution traces.
+// EnableDetailedTracing has different behaviour in the LegacyVM and FVM.
+// In the LegacyVM, it enables detailed gas tracing, slowing down execution.
+// In the FVM, it enables execution traces, which are primarily used to observe subcalls.
 var EnableDetailedTracing = os.Getenv("LOTUS_VM_ENABLE_TRACING") == "1"
 
 type Runtime struct {
@@ -108,9 +111,9 @@ func (rt *Runtime) TotalFilCircSupply() abi.TokenAmount {
 }
 
 func (rt *Runtime) ResolveAddress(addr address.Address) (ret address.Address, ok bool) {
-	r, err := rt.state.LookupID(addr)
+	r, err := rt.state.LookupIDAddress(addr)
 	if err != nil {
-		if xerrors.Is(err, types.ErrActorNotFound) {
+		if errors.Is(err, types.ErrActorNotFound) {
 			return address.Undef, false
 		}
 		panic(aerrors.Fatalf("failed to resolve address %s: %s", addr, err))
@@ -125,8 +128,8 @@ type notFoundErr interface {
 func (rt *Runtime) StoreGet(c cid.Cid, o cbor.Unmarshaler) bool {
 	if err := rt.cst.Get(context.TODO(), c, o); err != nil {
 		var nfe notFoundErr
-		if xerrors.As(err, &nfe) && nfe.IsNotFound() {
-			if xerrors.As(err, new(ipldcbor.SerializationError)) {
+		if errors.As(err, &nfe) && nfe.IsNotFound() {
+			if errors.As(err, new(ipldcbor.SerializationError)) {
 				panic(aerrors.Newf(exitcode.ErrSerialization, "failed to unmarshal cbor object %s", err))
 			}
 			return false
@@ -140,7 +143,7 @@ func (rt *Runtime) StoreGet(c cid.Cid, o cbor.Unmarshaler) bool {
 func (rt *Runtime) StorePut(x cbor.Marshaler) cid.Cid {
 	c, err := rt.cst.Put(context.TODO(), x)
 	if err != nil {
-		if xerrors.As(err, new(ipldcbor.SerializationError)) {
+		if errors.As(err, new(ipldcbor.SerializationError)) {
 			panic(aerrors.Newf(exitcode.ErrSerialization, "failed to marshal cbor object %s", err))
 		}
 		panic(aerrors.Fatalf("failed to put cbor object: %s", err))
@@ -165,13 +168,13 @@ func (rt *Runtime) shimCall(f func() interface{}) (rval []byte, aerr aerrors.Act
 				aerr = ar
 				return
 			}
-			//log.Desugar().WithOptions(zap.AddStacktrace(zapcore.ErrorLevel)).
-			//Sugar().Errorf("spec actors failure: %s", r)
+			// log.Desugar().WithOptions(zap.AddStacktrace(zapcore.ErrorLevel)).
+			// Sugar().Errorf("spec actors failure: %s", r)
 			log.Errorf("spec actors failure: %s", r)
 			if rt.NetworkVersion() <= network.Version3 {
 				aerr = aerrors.Newf(1, "spec actors failure: %s", r)
 			} else {
-				aerr = aerrors.Newf(exitcode.SysErrReserved1, "spec actors failure: %s", r)
+				aerr = aerrors.Newf(exitcode.SysErrIllegalInstruction, "spec actors failure: %s", r)
 			}
 		}
 	}()
@@ -216,7 +219,7 @@ func (rt *Runtime) CurrentBalance() abi.TokenAmount {
 func (rt *Runtime) GetActorCodeCID(addr address.Address) (ret cid.Cid, ok bool) {
 	act, err := rt.state.GetActor(addr)
 	if err != nil {
-		if xerrors.Is(err, types.ErrActorNotFound) {
+		if errors.Is(err, types.ErrActorNotFound) {
 			return cid.Undef, false
 		}
 
@@ -227,26 +230,40 @@ func (rt *Runtime) GetActorCodeCID(addr address.Address) (ret cid.Cid, ok bool) 
 }
 
 func (rt *Runtime) GetRandomnessFromTickets(personalization crypto.DomainSeparationTag, randEpoch abi.ChainEpoch, entropy []byte) abi.Randomness {
-	res, err := rt.vm.rand.GetChainRandomness(rt.ctx, personalization, randEpoch, entropy)
+	digest, err := rt.vm.rand.GetChainRandomness(rt.ctx, randEpoch)
 
 	if err != nil {
 		panic(aerrors.Fatalf("could not get ticket randomness: %s", err))
 	}
-	return res
+
+	ret, err := rand.DrawRandomnessFromDigest(digest, personalization, randEpoch, entropy)
+
+	if err != nil {
+		panic(aerrors.Fatalf("could not draw ticket randomness: %s", err))
+	}
+
+	return ret
 }
 
 func (rt *Runtime) GetRandomnessFromBeacon(personalization crypto.DomainSeparationTag, randEpoch abi.ChainEpoch, entropy []byte) abi.Randomness {
-	res, err := rt.vm.rand.GetBeaconRandomness(rt.ctx, personalization, randEpoch, entropy)
+	digest, err := rt.vm.rand.GetBeaconRandomness(rt.ctx, randEpoch)
 
 	if err != nil {
-		panic(aerrors.Fatalf("could not get beacon randomness: %s", err))
+		panic(aerrors.Fatalf("could not get ticket randomness: %s", err))
 	}
-	return res
+
+	ret, err := rand.DrawRandomnessFromDigest(digest, personalization, randEpoch, entropy)
+
+	if err != nil {
+		panic(aerrors.Fatalf("could not draw ticket randomness: %s", err))
+	}
+
+	return ret
 }
 
 func (rt *Runtime) NewActorAddress() address.Address {
 	var b bytes.Buffer
-	oa, _ := ResolveToKeyAddr(rt.vm.cstate, rt.vm.cst, rt.origin)
+	oa, _ := ResolveToDeterministicAddr(rt.vm.cstate, rt.vm.cst, rt.origin)
 	if err := oa.MarshalCBOR(&b); err != nil { // todo: spec says cbor; why not just bytes?
 		panic(aerrors.Fatalf("writing caller address into a buffer: %v", err))
 	}
@@ -297,7 +314,7 @@ func (rt *Runtime) DeleteActor(beneficiary address.Address) {
 	rt.chargeGas(rt.Pricelist().OnDeleteActor())
 	act, err := rt.state.GetActor(rt.Receiver())
 	if err != nil {
-		if xerrors.Is(err, types.ErrActorNotFound) {
+		if errors.Is(err, types.ErrActorNotFound) {
 			rt.Abortf(exitcode.SysErrorIllegalActor, "failed to load actor in delete actor: %s", err)
 		}
 		panic(aerrors.Fatalf("failed to get actor: %s", err))
@@ -371,7 +388,7 @@ func (rt *Runtime) ValidateImmediateCallerType(ts ...cid.Cid) {
 
 		// this really only for genesis in tests; nv16 will be running on FVM anyway.
 		if nv := rt.NetworkVersion(); nv >= network.Version16 {
-			av, err := actors.VersionForNetwork(nv)
+			av, err := actorstypes.VersionForNetwork(nv)
 			if err != nil {
 				panic(aerrors.Fatalf("failed to get actors version for network version %d", nv))
 			}
@@ -568,35 +585,18 @@ func (rt *Runtime) chargeGasFunc(skip int) func(GasCharge) {
 func (rt *Runtime) chargeGasInternal(gas GasCharge, skip int) aerrors.ActorError {
 	toUse := gas.Total()
 	if EnableDetailedTracing {
-		var callers [10]uintptr
-
-		cout := gruntime.Callers(2+skip, callers[:])
-
 		now := build.Clock.Now()
 		if rt.lastGasCharge != nil {
 			rt.lastGasCharge.TimeTaken = now.Sub(rt.lastGasChargeTime)
 		}
 
 		gasTrace := types.GasTrace{
-			Name:  gas.Name,
-			Extra: gas.Extra,
+			Name: gas.Name,
 
 			TotalGas:   toUse,
 			ComputeGas: gas.ComputeGas,
 			StorageGas: gas.StorageGas,
-
-			VirtualComputeGas: gas.VirtualCompute,
-			VirtualStorageGas: gas.VirtualStorage,
-
-			Callers: callers[:cout],
 		}
-		if gasTrace.VirtualStorageGas == 0 {
-			gasTrace.VirtualStorageGas = gasTrace.StorageGas
-		}
-		if gasTrace.VirtualComputeGas == 0 {
-			gasTrace.VirtualComputeGas = gasTrace.ComputeGas
-		}
-		gasTrace.TotalVirtualGas = gasTrace.VirtualComputeGas + gasTrace.VirtualStorageGas
 
 		rt.executionTrace.GasCharges = append(rt.executionTrace.GasCharges, &gasTrace)
 		rt.lastGasChargeTime = now

@@ -1,24 +1,34 @@
-//go:generate go run ./gen
-
 package sealing
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
+	"os"
 	"reflect"
+	"runtime"
 	"time"
 
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-statemachine"
+
+	"github.com/filecoin-project/lotus/api"
 )
+
+var errSectorRemoved = errors.New("sector removed")
 
 func (m *Sealing) Plan(events []statemachine.Event, user interface{}) (interface{}, uint64, error) {
 	next, processed, err := m.plan(events, user.(*SectorInfo))
 	if err != nil || next == nil {
+		if err == errSectorRemoved && os.Getenv("LOTUS_KEEP_REMOVED_FSM_ACTIVE") != "1" {
+			return nil, processed, statemachine.ErrTerminated
+		}
+
 		l := Log{
 			Timestamp: uint64(time.Now().Unix()),
 			Message:   fmt.Sprintf("state machine error: %s", err),
@@ -28,8 +38,27 @@ func (m *Sealing) Plan(events []statemachine.Event, user interface{}) (interface
 		return nil, processed, nil
 	}
 
-	return func(ctx statemachine.Context, si SectorInfo) error {
-		err := next(ctx, si)
+	return func(ctx statemachine.Context, si SectorInfo) (err error) {
+		// handle panics
+		defer func() {
+			if r := recover(); r != nil {
+				buf := make([]byte, 1<<16)
+				n := runtime.Stack(buf, false)
+				buf = buf[:n]
+
+				l := Log{
+					Timestamp: uint64(time.Now().Unix()),
+					Message:   fmt.Sprintf("panic: %v\n%s", r, buf),
+					Kind:      "panic",
+				}
+				si.logAppend(l)
+
+				err = fmt.Errorf("panic: %v\n%s", r, buf)
+			}
+		}()
+
+		// execute the next state
+		err = next(ctx, si)
 		if err != nil {
 			log.Errorf("unhandled sector error (%d): %+v", si.SectorNumber, err)
 			return nil
@@ -40,11 +69,17 @@ func (m *Sealing) Plan(events []statemachine.Event, user interface{}) (interface
 }
 
 var fsmPlanners = map[SectorState]func(events []statemachine.Event, state *SectorInfo) (uint64, error){
+	// external import
+	ReceiveSector: planOne(
+		onReturning(SectorReceived{}),
+	),
+
 	// Sealing
 
 	UndefinedSectorState: planOne(
 		on(SectorStart{}, WaitDeals),
 		on(SectorStartCC{}, Packing),
+		on(SectorReceive{}, ReceiveSector),
 	),
 	Empty: planOne( // deprecated
 		on(SectorAddPiece{}, AddPiece),
@@ -73,7 +108,7 @@ var fsmPlanners = map[SectorState]func(events []statemachine.Event, state *Secto
 		on(SectorOldTicket{}, GetTicket),
 	),
 	PreCommit2: planOne(
-		on(SectorPreCommit2{}, PreCommitting),
+		on(SectorPreCommit2{}, SubmitPreCommitBatch),
 		on(SectorSealPreCommit2Failed{}, SealPreCommit2Failed),
 		on(SectorSealPreCommit1Failed{}, SealPreCommit1Failed),
 	),
@@ -110,8 +145,8 @@ var fsmPlanners = map[SectorState]func(events []statemachine.Event, state *Secto
 	),
 	Committing: planCommitting,
 	CommitFinalize: planOne(
-		on(SectorFinalized{}, SubmitCommit),
-		on(SectorFinalizedAvailable{}, SubmitCommit),
+		on(SectorFinalized{}, SubmitCommitAggregate),
+		on(SectorFinalizedAvailable{}, SubmitCommitAggregate),
 		on(SectorFinalizeFailed{}, CommitFinalizeFailed),
 	),
 	SubmitCommit: planOne(
@@ -136,8 +171,8 @@ var fsmPlanners = map[SectorState]func(events []statemachine.Event, state *Secto
 	),
 
 	FinalizeSector: planOne(
-		on(SectorFinalized{}, Proving),
-		on(SectorFinalizedAvailable{}, Available),
+		onWithCB(SectorFinalized{}, Proving, maybeNotifyRemoteDone(true, "Proving")),
+		onWithCB(SectorFinalizedAvailable{}, Available, maybeNotifyRemoteDone(true, "Available")),
 		on(SectorFinalizeFailed{}, FinalizeFailed),
 	),
 
@@ -179,6 +214,11 @@ var fsmPlanners = map[SectorState]func(events []statemachine.Event, state *Secto
 	SubmitReplicaUpdate: planOne(
 		on(SectorReplicaUpdateSubmitted{}, ReplicaUpdateWait),
 		on(SectorSubmitReplicaUpdateFailed{}, ReplicaUpdateFailed),
+		on(SectorDeadlineImmutable{}, WaitMutable),
+	),
+	WaitMutable: planOne(
+		on(SectorDeadlineMutable{}, SubmitReplicaUpdate),
+		on(SectorAbortUpgrade{}, AbortUpgrade),
 	),
 	ReplicaUpdateWait: planOne(
 		on(SectorReplicaUpdateLanded{}, UpdateActivating),
@@ -212,12 +252,15 @@ var fsmPlanners = map[SectorState]func(events []statemachine.Event, state *Secto
 		on(SectorRetryWaitSeed{}, WaitSeed),
 		on(SectorSealPreCommit1Failed{}, SealPreCommit1Failed),
 		on(SectorPreCommitLanded{}, WaitSeed),
-		on(SectorDealsExpired{}, DealsExpired),
+		onWithCB(SectorDealsExpired{}, DealsExpired, maybeNotifyRemoteDone(false, "DealsExpired")),
 		on(SectorInvalidDealIDs{}, RecoverDealIDs),
 	),
 	ComputeProofFailed: planOne(
 		on(SectorRetryComputeProof{}, Committing),
 		on(SectorSealPreCommit1Failed{}, SealPreCommit1Failed),
+	),
+	RemoteCommitFailed: planOne(
+		on(SectorRetryComputeProof{}, Committing),
 	),
 	CommitFinalizeFailed: planOne(
 		on(SectorRetryFinalize{}, CommitFinalize),
@@ -232,9 +275,9 @@ var fsmPlanners = map[SectorState]func(events []statemachine.Event, state *Secto
 		on(SectorRetryPreCommit{}, PreCommitting),
 		on(SectorRetryCommitWait{}, CommitWait),
 		on(SectorRetrySubmitCommit{}, SubmitCommit),
-		on(SectorDealsExpired{}, DealsExpired),
+		onWithCB(SectorDealsExpired{}, DealsExpired, maybeNotifyRemoteDone(false, "DealsExpired")),
 		on(SectorInvalidDealIDs{}, RecoverDealIDs),
-		on(SectorTicketExpired{}, Removing),
+		onWithCB(SectorTicketExpired{}, Removing, maybeNotifyRemoteDone(false, "Removing")),
 	),
 	FinalizeFailed: planOne(
 		on(SectorRetryFinalize{}, FinalizeSector),
@@ -457,6 +500,9 @@ func (m *Sealing) plan(events []statemachine.Event, state *SectorInfo) (func(sta
 	}
 
 	switch state.State {
+	case ReceiveSector:
+		return m.handleReceiveSector, processed, nil
+
 	// Happy path
 	case Empty:
 		fallthrough
@@ -510,6 +556,8 @@ func (m *Sealing) plan(events []statemachine.Event, state *SectorInfo) (func(sta
 		return m.handleProveReplicaUpdate, processed, nil
 	case SubmitReplicaUpdate:
 		return m.handleSubmitReplicaUpdate, processed, nil
+	case WaitMutable:
+		return m.handleWaitMutable, processed, nil
 	case ReplicaUpdateWait:
 		return m.handleReplicaUpdateWait, processed, nil
 	case FinalizeReplicaUpdate:
@@ -530,6 +578,8 @@ func (m *Sealing) plan(events []statemachine.Event, state *SectorInfo) (func(sta
 		return m.handlePreCommitFailed, processed, nil
 	case ComputeProofFailed:
 		return m.handleComputeProofFailed, processed, nil
+	case RemoteCommitFailed:
+		return m.handleRemoteCommitFailed, processed, nil
 	case CommitFailed:
 		return m.handleCommitFailed, processed, nil
 	case CommitFinalizeFailed:
@@ -577,7 +627,7 @@ func (m *Sealing) plan(events []statemachine.Event, state *SectorInfo) (func(sta
 	case Removing:
 		return m.handleRemoving, processed, nil
 	case Removed:
-		return nil, processed, nil
+		return nil, processed, errSectorRemoved
 
 	case RemoveFailed:
 		return m.handleRemoveFailed, processed, nil
@@ -591,13 +641,14 @@ func (m *Sealing) plan(events []statemachine.Event, state *SectorInfo) (func(sta
 	// Fatal errors
 	case UndefinedSectorState:
 		log.Error("sector update with undefined state!")
+		return nil, processed, xerrors.Errorf("sector update with undefined state")
 	case FailedUnrecoverable:
 		log.Errorf("sector %d failed unrecoverably", state.SectorNumber)
+		return nil, processed, xerrors.Errorf("sector %d failed unrecoverably", state.SectorNumber)
 	default:
 		log.Errorf("unexpected sector update state: %s", state.State)
+		return nil, processed, xerrors.Errorf("unexpected sector update state: %s", state.State)
 	}
-
-	return nil, processed, nil
 }
 
 func (m *Sealing) onUpdateSector(ctx context.Context, state *SectorInfo) error {
@@ -641,7 +692,7 @@ func planCommitting(events []statemachine.Event, state *SectorInfo) (uint64, err
 			}
 		case SectorCommitted: // the normal case
 			e.apply(state)
-			state.State = SubmitCommit
+			state.State = SubmitCommitAggregate
 		case SectorProofReady: // early finalize
 			e.apply(state)
 			state.State = CommitFinalize
@@ -657,6 +708,8 @@ func planCommitting(events []statemachine.Event, state *SectorInfo) (uint64, err
 			return uint64(i + 1), nil
 		case SectorComputeProofFailed:
 			state.State = ComputeProofFailed
+		case SectorRemoteCommit1Failed, SectorRemoteCommit2Failed:
+			state.State = RemoteCommitFailed
 		case SectorSealPreCommit1Failed:
 			state.State = SealPreCommit1Failed
 		case SectorCommitFailed:
@@ -714,6 +767,16 @@ func final(events []statemachine.Event, state *SectorInfo) (uint64, error) {
 func on(mut mutator, next SectorState) func() (mutator, func(*SectorInfo) (bool, error)) {
 	return func() (mutator, func(*SectorInfo) (bool, error)) {
 		return mut, func(state *SectorInfo) (bool, error) {
+			state.State = next
+			return false, nil
+		}
+	}
+}
+
+func onWithCB(mut mutator, next SectorState, cb func(info *SectorInfo)) func() (mutator, func(*SectorInfo) (bool, error)) {
+	return func() (mutator, func(*SectorInfo) (bool, error)) {
+		return mut, func(state *SectorInfo) (bool, error) {
+			cb(state)
 			state.State = next
 			return false, nil
 		}
@@ -784,7 +847,7 @@ func planOne(ts ...func() (mut mutator, next func(*SectorInfo) (more bool, err e
 	}
 }
 
-// planOne but ignores unhandled states without erroring, this prevents the need to handle all possible events creating
+// planOneOrIgnore but ignores unhandled states without erroring, this prevents the need to handle all possible events creating
 // error during forced override
 func planOneOrIgnore(ts ...func() (mut mutator, next func(*SectorInfo) (more bool, err error))) func(events []statemachine.Event, state *SectorInfo) (uint64, error) {
 	f := planOne(ts...)
@@ -794,5 +857,46 @@ func planOneOrIgnore(ts ...func() (mut mutator, next func(*SectorInfo) (more boo
 			log.Warnf("planOneOrIgnore: ignoring error from planOne: %s", err)
 		}
 		return cnt, nil
+	}
+}
+
+// maybeNotifyRemoteDone will send sealing-done notification to the RemoteSealingDone
+// if the RemoteSealingDoneEndpoint is set. If RemoteSealingDoneEndpoint is not set,
+// this is no-op
+func maybeNotifyRemoteDone(success bool, state string) func(*SectorInfo) {
+	return func(sector *SectorInfo) {
+		if sector.RemoteSealingDoneEndpoint == "" {
+			return
+		}
+
+		reqData := api.RemoteSealingDoneParams{
+			Successful:    success,
+			State:         state,
+			CommitMessage: sector.CommitMessage,
+		}
+		reqBody, err := json.Marshal(&reqData)
+		if err != nil {
+			log.Errorf("marshaling remote done notification request params: %s", err)
+			return
+		}
+
+		req, err := http.NewRequest("POST", sector.RemoteSealingDoneEndpoint, bytes.NewReader(reqBody))
+		if err != nil {
+			log.Errorf("creating new remote done notification request: %s", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Errorf("sending remote done notification: %s", err)
+			return
+		}
+
+		defer resp.Body.Close() //nolint:errcheck
+
+		if resp.StatusCode != http.StatusOK {
+			log.Errorf("remote done notification received non-200 http response %s", resp.Status)
+			return
+		}
 	}
 }

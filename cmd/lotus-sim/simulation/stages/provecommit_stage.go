@@ -8,7 +8,7 @@ import (
 	"github.com/filecoin-project/go-bitfield"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/builtin"
-	minertypes "github.com/filecoin-project/go-state-types/builtin/v8/miner"
+	minertypes "github.com/filecoin-project/go-state-types/builtin/v9/miner"
 	"github.com/filecoin-project/go-state-types/exitcode"
 	"github.com/filecoin-project/go-state-types/network"
 	miner5 "github.com/filecoin-project/specs-actors/v5/actors/builtin/miner"
@@ -54,7 +54,7 @@ func (stage *ProveCommitStage) EnqueueProveCommit(
 	return stage.commitQueue.enqueueProveCommit(minerAddr, preCommitEpoch, info)
 }
 
-// packProveCommits packs all prove-commits for all "ready to be proven" sectors until it fills the
+// PackMessages packs all prove-commits for all "ready to be proven" sectors until it fills the
 // block or runs out.
 func (stage *ProveCommitStage) PackMessages(ctx context.Context, bb *blockbuilder.BlockBuilder) (_err error) {
 	if !stage.initialized {
@@ -376,7 +376,7 @@ func (stage *ProveCommitStage) load(ctx context.Context, bb *blockbuilder.BlockB
 			return nil
 		}
 		return stage.loadMiner(ctx, bb, minerAddr)
-	})
+	}, false)
 	if err != nil {
 		return err
 	}

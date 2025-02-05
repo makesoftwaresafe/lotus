@@ -2,6 +2,7 @@ package market
 
 import (
 	"bytes"
+	"fmt"
 
 	"github.com/ipfs/go-cid"
 	cbg "github.com/whyrusleeping/cbor-gen"
@@ -9,10 +10,14 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+	"github.com/filecoin-project/go-state-types/manifest"
 	market2 "github.com/filecoin-project/specs-actors/v2/actors/builtin/market"
 	adt2 "github.com/filecoin-project/specs-actors/v2/actors/util/adt"
 
+	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
+	verifregtypes "github.com/filecoin-project/lotus/chain/actors/builtin/verifreg"
 	"github.com/filecoin-project/lotus/chain/types"
 )
 
@@ -102,6 +107,14 @@ func (s *state2) Proposals() (DealProposals, error) {
 	return &dealProposals2{proposalArray}, nil
 }
 
+func (s *state2) PendingProposals() (PendingProposals, error) {
+	proposalCidSet, err := adt2.AsSet(s.store, s.State.PendingProposals)
+	if err != nil {
+		return nil, err
+	}
+	return &pendingProposals2{proposalCidSet}, nil
+}
+
 func (s *state2) EscrowTable() (BalanceTable, error) {
 	bt, err := adt2.AsBalanceTable(s.store, s.State.EscrowTable)
 	if err != nil {
@@ -120,9 +133,9 @@ func (s *state2) LockedTable() (BalanceTable, error) {
 
 func (s *state2) VerifyDealsForActivation(
 	minerAddr address.Address, deals []abi.DealID, currEpoch, sectorExpiry abi.ChainEpoch,
-) (weight, verifiedWeight abi.DealWeight, err error) {
-	w, vw, _, err := market2.ValidateDealsForActivation(&s.State, s.store, deals, minerAddr, sectorExpiry, currEpoch)
-	return w, vw, err
+) (verifiedWeight abi.DealWeight, err error) {
+	_, vw, _, err := market2.ValidateDealsForActivation(&s.State, s.store, deals, minerAddr, sectorExpiry, currEpoch)
+	return vw, err
 }
 
 func (s *state2) NextID() (abi.DealID, error) {
@@ -149,7 +162,7 @@ type dealStates2 struct {
 	adt.Array
 }
 
-func (s *dealStates2) Get(dealID abi.DealID) (*DealState, bool, error) {
+func (s *dealStates2) Get(dealID abi.DealID) (DealState, bool, error) {
 	var deal2 market2.DealState
 	found, err := s.Array.Get(uint64(dealID), &deal2)
 	if err != nil {
@@ -159,7 +172,7 @@ func (s *dealStates2) Get(dealID abi.DealID) (*DealState, bool, error) {
 		return nil, false, nil
 	}
 	deal := fromV2DealState(deal2)
-	return &deal, true, nil
+	return deal, true, nil
 }
 
 func (s *dealStates2) ForEach(cb func(dealID abi.DealID, ds DealState) error) error {
@@ -169,21 +182,63 @@ func (s *dealStates2) ForEach(cb func(dealID abi.DealID, ds DealState) error) er
 	})
 }
 
-func (s *dealStates2) decode(val *cbg.Deferred) (*DealState, error) {
+func (s *dealStates2) decode(val *cbg.Deferred) (DealState, error) {
 	var ds2 market2.DealState
 	if err := ds2.UnmarshalCBOR(bytes.NewReader(val.Raw)); err != nil {
 		return nil, err
 	}
 	ds := fromV2DealState(ds2)
-	return &ds, nil
+	return ds, nil
 }
 
 func (s *dealStates2) array() adt.Array {
 	return s.Array
 }
 
+type dealStateV2 struct {
+	ds2 market2.DealState
+}
+
+func (d dealStateV2) SectorNumber() abi.SectorNumber {
+
+	return 0
+
+}
+
+func (d dealStateV2) SectorStartEpoch() abi.ChainEpoch {
+	return d.ds2.SectorStartEpoch
+}
+
+func (d dealStateV2) LastUpdatedEpoch() abi.ChainEpoch {
+	return d.ds2.LastUpdatedEpoch
+}
+
+func (d dealStateV2) SlashEpoch() abi.ChainEpoch {
+	return d.ds2.SlashEpoch
+}
+
+func (d dealStateV2) Equals(other DealState) bool {
+	if ov2, ok := other.(dealStateV2); ok {
+		return d.ds2 == ov2.ds2
+	}
+
+	if d.SectorStartEpoch() != other.SectorStartEpoch() {
+		return false
+	}
+	if d.LastUpdatedEpoch() != other.LastUpdatedEpoch() {
+		return false
+	}
+	if d.SlashEpoch() != other.SlashEpoch() {
+		return false
+	}
+
+	return true
+}
+
+var _ DealState = (*dealStateV2)(nil)
+
 func fromV2DealState(v2 market2.DealState) DealState {
-	return (DealState)(v2)
+	return dealStateV2{v2}
 }
 
 type dealProposals2 struct {
@@ -238,9 +293,18 @@ func (s *dealProposals2) array() adt.Array {
 	return s.Array
 }
 
+type pendingProposals2 struct {
+	*adt2.Set
+}
+
+func (s *pendingProposals2) Has(proposalCid cid.Cid) (bool, error) {
+	return s.Set.Has(abi.CidKey(proposalCid))
+}
+
 func fromV2DealProposal(v2 market2.DealProposal) (DealProposal, error) {
 
 	label, err := labelFromGoString(v2.Label)
+
 	if err != nil {
 		return DealProposal{}, xerrors.Errorf("error setting deal label: %w", err)
 	}
@@ -291,4 +355,27 @@ func (r *publishStorageDealsReturn2) IsDealValid(index uint64) (bool, int, error
 
 func (r *publishStorageDealsReturn2) DealIDs() ([]abi.DealID, error) {
 	return r.IDs, nil
+}
+
+func (s *state2) GetAllocationIdForPendingDeal(dealId abi.DealID) (verifregtypes.AllocationId, error) {
+
+	return verifregtypes.NoAllocationID, xerrors.Errorf("unsupported before actors v9")
+
+}
+
+func (s *state2) ActorKey() string {
+	return manifest.MarketKey
+}
+
+func (s *state2) ActorVersion() actorstypes.Version {
+	return actorstypes.Version2
+}
+
+func (s *state2) Code() cid.Cid {
+	code, ok := actors.GetActorCodeID(s.ActorVersion(), s.ActorKey())
+	if !ok {
+		panic(fmt.Errorf("didn't find actor %v code id for actor version %d", s.ActorKey(), s.ActorVersion()))
+	}
+
+	return code
 }

@@ -2,6 +2,7 @@ package stmgr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 
@@ -27,23 +28,26 @@ import (
 	"github.com/filecoin-project/lotus/node/modules/dtypes"
 )
 
+var ErrMetadataNotFound = errors.New("actor metadata not found")
+
 func GetReturnType(ctx context.Context, sm *StateManager, to address.Address, method abi.MethodNum, ts *types.TipSet) (cbg.CBORUnmarshaler, error) {
 	act, err := sm.LoadActor(ctx, to, ts)
 	if err != nil {
-		return nil, xerrors.Errorf("(get sset) failed to load miner actor: %w", err)
+		return nil, xerrors.Errorf("(get sset) failed to load actor: %w", err)
 	}
 
 	m, found := sm.tsExec.NewActorRegistry().Methods[act.Code][method]
 	if !found {
-		return nil, fmt.Errorf("unknown method %d for actor %s", method, act.Code)
+		return nil, fmt.Errorf("unknown method %d for actor %s: %w", method, act.Code, ErrMetadataNotFound)
 	}
+
 	return reflect.New(m.Ret.Elem()).Interface().(cbg.CBORUnmarshaler), nil
 }
 
 func GetParamType(ar *vm.ActorRegistry, actCode cid.Cid, method abi.MethodNum) (cbg.CBORUnmarshaler, error) {
 	m, found := ar.Methods[actCode][method]
 	if !found {
-		return nil, fmt.Errorf("unknown method %d for actor %s", method, actCode)
+		return nil, fmt.Errorf("unknown method %d for actor %s: %w", method, actCode, ErrMetadataNotFound)
 	}
 	return reflect.New(m.Params.Elem()).Interface().(cbg.CBORUnmarshaler), nil
 }
@@ -68,7 +72,7 @@ func ComputeState(ctx context.Context, sm *StateManager, height abi.ChainEpoch, 
 
 	base, trace, err := sm.ExecutionTrace(ctx, ts)
 	if err != nil {
-		return cid.Undef, nil, err
+		return cid.Undef, nil, xerrors.Errorf("failed to compute base state: %w", err)
 	}
 
 	for i := ts.Height(); i < height; i++ {
@@ -86,6 +90,7 @@ func ComputeState(ctx context.Context, sm *StateManager, height abi.ChainEpoch, 
 	vmopt := &vm.VMOpts{
 		StateBase:      base,
 		Epoch:          height,
+		Timestamp:      ts.MinTimestamp(),
 		Rand:           r,
 		Bstore:         sm.cs.StateBlockstore(),
 		Actors:         sm.tsExec.NewActorRegistry(),
@@ -94,6 +99,8 @@ func ComputeState(ctx context.Context, sm *StateManager, height abi.ChainEpoch, 
 		NetworkVersion: sm.GetNetworkVersion(ctx, height),
 		BaseFee:        ts.Blocks()[0].ParentBaseFee,
 		LookbackState:  LookbackStateGetterForTipset(sm, ts),
+		TipSetGetter:   TipSetGetterForTipset(sm.cs, ts),
+		Tracing:        true,
 	}
 	vmi, err := sm.newVM(ctx, vmopt)
 	if err != nil {
@@ -109,6 +116,21 @@ func ComputeState(ctx context.Context, sm *StateManager, height abi.ChainEpoch, 
 		if ret.ExitCode != 0 {
 			log.Infof("compute state apply message %d failed (exit: %d): %s", i, ret.ExitCode, ret.ActorErr)
 		}
+
+		ir := &api.InvocResult{
+			MsgCid:         msg.Cid(),
+			Msg:            msg,
+			MsgRct:         &ret.MessageReceipt,
+			ExecutionTrace: ret.ExecutionTrace,
+			Duration:       ret.Duration,
+		}
+		if ret.ActorErr != nil {
+			ir.Error = ret.ActorErr.Error()
+		}
+		if ret.GasCosts != nil {
+			ir.GasCost = MakeMsgGasCost(msg, ret)
+		}
+		trace = append(trace, ir)
 	}
 
 	root, err := vmi.Flush(ctx)
@@ -126,6 +148,16 @@ func LookbackStateGetterForTipset(sm *StateManager, ts *types.TipSet) vm.Lookbac
 			return nil, err
 		}
 		return sm.StateTree(st)
+	}
+}
+
+func TipSetGetterForTipset(cs *store.ChainStore, ts *types.TipSet) vm.TipSetGetter {
+	return func(ctx context.Context, round abi.ChainEpoch) (types.TipSetKey, error) {
+		ts, err := cs.GetTipsetByHeight(ctx, round, ts, true)
+		if err != nil {
+			return types.EmptyTSK, err
+		}
+		return ts.Key(), nil
 	}
 }
 
@@ -215,7 +247,7 @@ func (sm *StateManager) ListAllActors(ctx context.Context, ts *types.TipSet) ([]
 	return out, nil
 }
 
-func GetManifest(ctx context.Context, st *state.StateTree) (*manifest.Manifest, error) {
+func GetManifestData(ctx context.Context, st *state.StateTree) (*manifest.ManifestData, error) {
 	wrapStore := gstStore.WrapStore(ctx, st.Store)
 
 	systemActor, err := st.GetActor(system.Address)
@@ -226,30 +258,13 @@ func GetManifest(ctx context.Context, st *state.StateTree) (*manifest.Manifest, 
 	if err != nil {
 		return nil, xerrors.Errorf("failed to load system actor state: %w", err)
 	}
-	actorsManifestCid := systemActorState.GetBuiltinActors()
 
-	mf := manifest.Manifest{
-		Version: 1,
-		Data:    actorsManifestCid,
-	}
-	if err := mf.Load(ctx, wrapStore); err != nil {
-		return nil, xerrors.Errorf("failed to load actor manifest: %w", err)
-	}
-	manifestData := manifest.ManifestData{}
-	if err := st.Store.Get(ctx, mf.Data, &manifestData); err != nil {
-		return nil, xerrors.Errorf("failed to load manifest data: %w", err)
-	}
-	return &mf, nil
-}
+	actorsManifestDataCid := systemActorState.GetBuiltinActors()
 
-func GetManifestEntries(ctx context.Context, st *state.StateTree) ([]manifest.ManifestEntry, error) {
-	mf, err := GetManifest(ctx, st)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to get manifest: %w", err)
+	var mfData manifest.ManifestData
+	if err := wrapStore.Get(ctx, actorsManifestDataCid, &mfData); err != nil {
+		return nil, xerrors.Errorf("error fetching data: %w", err)
 	}
-	manifestData := manifest.ManifestData{}
-	if err := st.Store.Get(ctx, mf.Data, &manifestData); err != nil {
-		return nil, xerrors.Errorf("filed to load manifest data: %w", err)
-	}
-	return manifestData.Entries, nil
+
+	return &mfData, nil
 }

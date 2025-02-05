@@ -10,7 +10,7 @@ import (
 	big2 "github.com/filecoin-project/go-state-types/big"
 
 	bstore "github.com/filecoin-project/lotus/blockstore"
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/power"
 	"github.com/filecoin-project/lotus/chain/state"
 	"github.com/filecoin-project/lotus/chain/store"
@@ -29,7 +29,7 @@ func Weight(ctx context.Context, stateBs bstore.Blockstore, ts *types.TipSet) (t
 
 	// >>> wFunction(totalPowerAtTipset(ts)) * 2^8 <<< + (wFunction(totalPowerAtTipset(ts)) * sum(ts.blocks[].ElectionProof.WinCount) * wRatio_num * 2^8) / (e * wRatio_den)
 
-	tpow := big2.Zero()
+	var tpow big2.Int
 	{
 		cst := cbor.NewCborStore(stateBs)
 		state, err := state.LoadStateTree(cst, ts.ParentState())
@@ -72,10 +72,10 @@ func Weight(ctx context.Context, stateBs bstore.Blockstore, ts *types.TipSet) (t
 		totalJ += b.ElectionProof.WinCount
 	}
 
-	eWeight := big.NewInt((log2P * build.WRatioNum))
+	eWeight := big.NewInt((log2P * buildconstants.WRatioNum))
 	eWeight = eWeight.Lsh(eWeight, 8)
 	eWeight = eWeight.Mul(eWeight, new(big.Int).SetInt64(totalJ))
-	eWeight = eWeight.Div(eWeight, big.NewInt(int64(build.BlocksPerEpoch*build.WRatioDen)))
+	eWeight = eWeight.Div(eWeight, big.NewInt(int64(buildconstants.BlocksPerEpoch*buildconstants.WRatioDen)))
 
 	out = out.Add(out, eWeight)
 

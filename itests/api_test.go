@@ -1,13 +1,14 @@
-//stm: #integration
 package itests
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	logging "github.com/ipfs/go-log/v2"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/require"
 
 	"github.com/filecoin-project/go-address"
@@ -16,22 +17,23 @@ import (
 
 	lapi "github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/itests/kit"
 )
 
 func TestAPI(t *testing.T) {
-	//stm: @CHAIN_SYNCER_LOAD_GENESIS_001, @CHAIN_SYNCER_FETCH_TIPSET_001,
-	//stm: @CHAIN_SYNCER_START_001, @CHAIN_SYNCER_SYNC_001, @BLOCKCHAIN_BEACON_VALIDATE_BLOCK_VALUES_01
-	//stm: @CHAIN_SYNCER_COLLECT_CHAIN_001, @CHAIN_SYNCER_COLLECT_HEADERS_001, @CHAIN_SYNCER_VALIDATE_TIPSET_001
-	//stm: @CHAIN_SYNCER_NEW_PEER_HEAD_001, @CHAIN_SYNCER_VALIDATE_MESSAGE_META_001, @CHAIN_SYNCER_STOP_001
 
-	//stm: @CHAIN_STATE_MINER_INFO_001
+	ts := apiSuite{}
+	t.Run("testMiningReal", ts.testMiningReal)
+	ts.opts = append(ts.opts, kit.ThroughRPC())
+	t.Run("testMiningReal", ts.testMiningReal)
+
 	t.Run("direct", func(t *testing.T) {
-		runAPITest(t)
+		runAPITest(t, kit.MockProofs())
 	})
 	t.Run("rpc", func(t *testing.T) {
-		runAPITest(t, kit.ThroughRPC())
+		runAPITest(t, kit.MockProofs(), kit.ThroughRPC())
 	})
 }
 
@@ -47,9 +49,10 @@ func runAPITest(t *testing.T, opts ...interface{}) {
 	t.Run("id", ts.testID)
 	t.Run("testConnectTwo", ts.testConnectTwo)
 	t.Run("testMining", ts.testMining)
-	t.Run("testMiningReal", ts.testMiningReal)
 	t.Run("testSlowNotify", ts.testSlowNotify)
 	t.Run("testSearchMsg", ts.testSearchMsg)
+	t.Run("testOutOfGasError", ts.testOutOfGasError)
+	t.Run("testLookupNotFoundError", ts.testLookupNotFoundError)
 	t.Run("testNonGenesisMiner", ts.testNonGenesisMiner)
 }
 
@@ -66,7 +69,7 @@ func (ts *apiSuite) testVersion(t *testing.T) {
 
 	versions := strings.Split(v.Version, "+")
 	require.NotZero(t, len(versions), "empty version")
-	require.Equal(t, versions[0], build.BuildVersion)
+	require.Equal(t, versions[0], build.NodeBuildVersion)
 }
 
 func (ts *apiSuite) testID(t *testing.T) {
@@ -78,7 +81,7 @@ func (ts *apiSuite) testID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	require.Regexp(t, "^12", id.Pretty())
+	require.Regexp(t, "^12", id.String())
 }
 
 func (ts *apiSuite) testConnectTwo(t *testing.T) {
@@ -98,11 +101,21 @@ func (ts *apiSuite) testConnectTwo(t *testing.T) {
 
 	peers, err := one.NetPeers(ctx)
 	require.NoError(t, err)
-	require.Lenf(t, peers, 2, "node one doesn't have 2 peers")
+
+	countPeerIDs := func(peers []peer.AddrInfo) int {
+		peerIDs := make(map[peer.ID]struct{})
+		for _, p := range peers {
+			peerIDs[p.ID] = struct{}{}
+		}
+
+		return len(peerIDs)
+	}
+
+	require.Equal(t, countPeerIDs(peers), 1, "node one doesn't have 1 peer")
 
 	peers, err = two.NetPeers(ctx)
 	require.NoError(t, err)
-	require.Lenf(t, peers, 2, "node two doesn't have 2 peers")
+	require.Equal(t, countPeerIDs(peers), 1, "node one doesn't have 1 peer")
 }
 
 func (ts *apiSuite) testSearchMsg(t *testing.T) {
@@ -124,18 +137,58 @@ func (ts *apiSuite) testSearchMsg(t *testing.T) {
 	sm, err := full.MpoolPushMessage(ctx, msg, nil)
 	require.NoError(t, err)
 
-	//stm: @CHAIN_STATE_WAIT_MSG_001
 	res, err := full.StateWaitMsg(ctx, sm.Cid(), 1, lapi.LookbackNoLimit, true)
 	require.NoError(t, err)
 
 	require.Equal(t, exitcode.Ok, res.Receipt.ExitCode, "message not successful")
 
-	//stm: @CHAIN_STATE_SEARCH_MSG_001
 	searchRes, err := full.StateSearchMsg(ctx, types.EmptyTSK, sm.Cid(), lapi.LookbackNoLimit, true)
 	require.NoError(t, err)
 	require.NotNil(t, searchRes)
 
 	require.Equalf(t, res.TipSet, searchRes.TipSet, "search ts: %s, different from wait ts: %s", searchRes.TipSet, res.TipSet)
+}
+
+func (ts *apiSuite) testOutOfGasError(t *testing.T) {
+	ctx := context.Background()
+
+	full, _, _ := kit.EnsembleMinimal(t, ts.opts...)
+
+	senderAddr, err := full.WalletDefaultAddress(ctx)
+	require.NoError(t, err)
+
+	// the gas estimator API executes the message with gasLimit = BlockGasLimit
+	// Lowering it to 2 will cause it to run out of gas, testing the failure case we want
+	originalLimit := buildconstants.BlockGasLimit
+	buildconstants.BlockGasLimit = 2
+	defer func() {
+		buildconstants.BlockGasLimit = originalLimit
+	}()
+
+	t.Logf("BlockGasLimit changed: %d", buildconstants.BlockGasLimit)
+
+	msg := &types.Message{
+		From:  senderAddr,
+		To:    senderAddr,
+		Value: big.Zero(),
+	}
+
+	_, err = full.GasEstimateMessageGas(ctx, msg, nil, types.EmptyTSK)
+	require.Error(t, err, "should have failed")
+	require.True(t, errors.Is(err, &lapi.ErrOutOfGas{}))
+}
+
+func (ts *apiSuite) testLookupNotFoundError(t *testing.T) {
+	ctx := context.Background()
+
+	full, _, _ := kit.EnsembleMinimal(t, ts.opts...)
+
+	addr, err := full.WalletNew(ctx, types.KTSecp256k1)
+	require.NoError(t, err)
+
+	_, err = full.StateLookupID(ctx, addr, types.EmptyTSK)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, &lapi.ErrActorNotFound{}))
 }
 
 func (ts *apiSuite) testMining(t *testing.T) {
@@ -230,6 +283,7 @@ func (ts *apiSuite) testNonGenesisMiner(t *testing.T) {
 	ctx := context.Background()
 
 	full, genesisMiner, ens := kit.EnsembleMinimal(t, append(ts.opts, kit.MockProofs())...)
+
 	ens.InterconnectAll().BeginMining(4 * time.Millisecond)
 
 	time.Sleep(1 * time.Second)
@@ -253,5 +307,5 @@ func (ts *apiSuite) testNonGenesisMiner(t *testing.T) {
 	tid, err := address.IDFromAddress(ta)
 	require.NoError(t, err)
 
-	require.Equal(t, uint64(1001), tid)
+	require.Equal(t, uint64(1002), tid) // ETH0 is 1001
 }

@@ -14,13 +14,13 @@ import (
 	"github.com/filecoin-project/go-state-types/builtin/v8/paych"
 
 	lapi "github.com/filecoin-project/lotus/api"
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	lpaych "github.com/filecoin-project/lotus/chain/actors/builtin/paych"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/paychmgr"
 )
 
-var paychCmd = &cli.Command{
+var PaychCmd = &cli.Command{
 	Name:  "paych",
 	Usage: "Manage payment channels",
 	Subcommands: []*cli.Command{
@@ -40,18 +40,13 @@ var paychAddFundsCmd = &cli.Command{
 	ArgsUsage: "[fromAddress toAddress amount]",
 	Flags: []cli.Flag{
 		&cli.BoolFlag{
-			Name:  "restart-retrievals",
-			Usage: "restart stalled retrieval deals on this payment channel",
-			Value: true,
-		},
-		&cli.BoolFlag{
 			Name:  "reserve",
 			Usage: "mark funds as reserved",
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 3 {
-			return ShowHelp(cctx, fmt.Errorf("must pass three arguments: <from> <to> <available funds>"))
+		if cctx.NArg() != 3 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		from, err := address.NewFromString(cctx.Args().Get(0))
@@ -98,11 +93,7 @@ var paychAddFundsCmd = &cli.Command{
 			return err
 		}
 
-		fmt.Fprintln(cctx.App.Writer, chAddr)
-		restartRetrievals := cctx.Bool("restart-retrievals")
-		if restartRetrievals {
-			return api.ClientRetrieveTryRestartInsufficientFunds(ctx, chAddr)
-		}
+		_, _ = fmt.Fprintln(cctx.App.Writer, chAddr)
 		return nil
 	},
 }
@@ -112,8 +103,8 @@ var paychStatusByFromToCmd = &cli.Command{
 	Usage:     "Show the status of an active outbound payment channel by from/to addresses",
 	ArgsUsage: "[fromAddress toAddress]",
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 2 {
-			return ShowHelp(cctx, fmt.Errorf("must pass two arguments: <from address> <to address>"))
+		if cctx.NArg() != 2 {
+			return IncorrectNumArgs(cctx)
 		}
 		ctx := ReqContext(cctx)
 
@@ -148,8 +139,8 @@ var paychStatusCmd = &cli.Command{
 	Usage:     "Show the status of an outbound payment channel",
 	ArgsUsage: "[channelAddress]",
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 1 {
-			return ShowHelp(cctx, fmt.Errorf("must pass an argument: <channel address>"))
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
 		}
 		ctx := ReqContext(cctx)
 
@@ -177,23 +168,23 @@ var paychStatusCmd = &cli.Command{
 func paychStatus(writer io.Writer, avail *lapi.ChannelAvailableFunds) {
 	if avail.Channel == nil {
 		if avail.PendingWaitSentinel != nil {
-			fmt.Fprint(writer, "Creating channel\n")
-			fmt.Fprintf(writer, "  From:          %s\n", avail.From)
-			fmt.Fprintf(writer, "  To:            %s\n", avail.To)
-			fmt.Fprintf(writer, "  Pending Amt:   %s\n", types.FIL(avail.PendingAmt))
-			fmt.Fprintf(writer, "  Wait Sentinel: %s\n", avail.PendingWaitSentinel)
+			_, _ = fmt.Fprint(writer, "Creating channel\n")
+			_, _ = fmt.Fprintf(writer, "  From:          %s\n", avail.From)
+			_, _ = fmt.Fprintf(writer, "  To:            %s\n", avail.To)
+			_, _ = fmt.Fprintf(writer, "  Pending Amt:   %s\n", types.FIL(avail.PendingAmt))
+			_, _ = fmt.Fprintf(writer, "  Wait Sentinel: %s\n", avail.PendingWaitSentinel)
 			return
 		}
-		fmt.Fprint(writer, "Channel does not exist\n")
-		fmt.Fprintf(writer, "  From: %s\n", avail.From)
-		fmt.Fprintf(writer, "  To:   %s\n", avail.To)
+		_, _ = fmt.Fprint(writer, "Channel does not exist\n")
+		_, _ = fmt.Fprintf(writer, "  From: %s\n", avail.From)
+		_, _ = fmt.Fprintf(writer, "  To:   %s\n", avail.To)
 		return
 	}
 
 	if avail.PendingWaitSentinel != nil {
-		fmt.Fprint(writer, "Adding Funds to channel\n")
+		_, _ = fmt.Fprint(writer, "Adding Funds to channel\n")
 	} else {
-		fmt.Fprint(writer, "Channel exists\n")
+		_, _ = fmt.Fprint(writer, "Channel exists\n")
 	}
 
 	nameValues := [][]string{
@@ -213,7 +204,7 @@ func paychStatus(writer io.Writer, avail *lapi.ChannelAvailableFunds) {
 			avail.PendingWaitSentinel.String(),
 		})
 	}
-	fmt.Fprint(writer, formatNameValues(nameValues))
+	_, _ = fmt.Fprint(writer, formatNameValues(nameValues))
 }
 
 func formatNameValues(nameValues [][]string) string {
@@ -249,7 +240,7 @@ var paychListCmd = &cli.Command{
 		}
 
 		for _, v := range chs {
-			fmt.Fprintln(cctx.App.Writer, v.String())
+			_, _ = fmt.Fprintln(cctx.App.Writer, v.String())
 		}
 		return nil
 	},
@@ -260,8 +251,8 @@ var paychSettleCmd = &cli.Command{
 	Usage:     "Settle a payment channel",
 	ArgsUsage: "[channelAddress]",
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 1 {
-			return fmt.Errorf("must pass payment channel address")
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		ch, err := address.NewFromString(cctx.Args().Get(0))
@@ -282,15 +273,15 @@ var paychSettleCmd = &cli.Command{
 			return err
 		}
 
-		mwait, err := api.StateWaitMsg(ctx, mcid, build.MessageConfidence)
+		mwait, err := api.StateWaitMsg(ctx, mcid, buildconstants.MessageConfidence)
 		if err != nil {
 			return nil
 		}
-		if mwait.Receipt.ExitCode != 0 {
+		if mwait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("settle message execution failed (exit code %d)", mwait.Receipt.ExitCode)
 		}
 
-		fmt.Fprintf(cctx.App.Writer, "Settled channel %s\n", ch)
+		_, _ = fmt.Fprintf(cctx.App.Writer, "Settled channel %s\n", ch)
 		return nil
 	},
 }
@@ -300,8 +291,8 @@ var paychCloseCmd = &cli.Command{
 	Usage:     "Collect funds for a payment channel",
 	ArgsUsage: "[channelAddress]",
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 1 {
-			return fmt.Errorf("must pass payment channel address")
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		ch, err := address.NewFromString(cctx.Args().Get(0))
@@ -322,15 +313,15 @@ var paychCloseCmd = &cli.Command{
 			return err
 		}
 
-		mwait, err := api.StateWaitMsg(ctx, mcid, build.MessageConfidence)
+		mwait, err := api.StateWaitMsg(ctx, mcid, buildconstants.MessageConfidence)
 		if err != nil {
 			return nil
 		}
-		if mwait.Receipt.ExitCode != 0 {
+		if mwait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("collect message execution failed (exit code %d)", mwait.Receipt.ExitCode)
 		}
 
-		fmt.Fprintf(cctx.App.Writer, "Collected funds for channel %s\n", ch)
+		_, _ = fmt.Fprintf(cctx.App.Writer, "Collected funds for channel %s\n", ch)
 		return nil
 	},
 }
@@ -360,8 +351,8 @@ var paychVoucherCreateCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 2 {
-			return ShowHelp(cctx, fmt.Errorf("must pass two arguments: <channel> <amount>"))
+		if cctx.NArg() != 2 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		ch, err := address.NewFromString(cctx.Args().Get(0))
@@ -390,7 +381,7 @@ var paychVoucherCreateCmd = &cli.Command{
 		}
 
 		if v.Voucher == nil {
-			return fmt.Errorf("Could not create voucher: insufficient funds in channel, shortfall: %d", v.Shortfall)
+			return fmt.Errorf("could not create voucher: insufficient funds in channel, shortfall: %d", v.Shortfall)
 		}
 
 		enc, err := EncodedString(v.Voucher)
@@ -398,7 +389,7 @@ var paychVoucherCreateCmd = &cli.Command{
 			return err
 		}
 
-		fmt.Fprintln(cctx.App.Writer, enc)
+		_, _ = fmt.Fprintln(cctx.App.Writer, enc)
 		return nil
 	},
 }
@@ -408,8 +399,8 @@ var paychVoucherCheckCmd = &cli.Command{
 	Usage:     "Check validity of payment channel voucher",
 	ArgsUsage: "[channelAddress voucher]",
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 2 {
-			return ShowHelp(cctx, fmt.Errorf("must pass payment channel address and voucher to validate"))
+		if cctx.NArg() != 2 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		ch, err := address.NewFromString(cctx.Args().Get(0))
@@ -434,7 +425,7 @@ var paychVoucherCheckCmd = &cli.Command{
 			return err
 		}
 
-		fmt.Fprintln(cctx.App.Writer, "voucher is valid")
+		_, _ = fmt.Fprintln(cctx.App.Writer, "voucher is valid")
 		return nil
 	},
 }
@@ -444,8 +435,8 @@ var paychVoucherAddCmd = &cli.Command{
 	Usage:     "Add payment channel voucher to local datastore",
 	ArgsUsage: "[channelAddress voucher]",
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 2 {
-			return ShowHelp(cctx, fmt.Errorf("must pass payment channel address and voucher"))
+		if cctx.NArg() != 2 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		ch, err := address.NewFromString(cctx.Args().Get(0))
@@ -486,8 +477,8 @@ var paychVoucherListCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 1 {
-			return ShowHelp(cctx, fmt.Errorf("must pass payment channel address"))
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		ch, err := address.NewFromString(cctx.Args().Get(0))
@@ -531,8 +522,8 @@ var paychVoucherBestSpendableCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 1 {
-			return ShowHelp(cctx, fmt.Errorf("must pass payment channel address"))
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		ch, err := address.NewFromString(cctx.Args().Get(0))
@@ -589,12 +580,16 @@ func outputVoucher(w io.Writer, v *paych.SignedVoucher, export bool) error {
 		}
 	}
 
-	fmt.Fprintf(w, "Lane %d, Nonce %d: %s", v.Lane, v.Nonce, types.FIL(v.Amount))
-	if export {
-		fmt.Fprintf(w, "; %s", enc)
+	if _, err := fmt.Fprintf(w, "Lane %d, Nonce %d: %s", v.Lane, v.Nonce, types.FIL(v.Amount)); err != nil {
+		return err
 	}
-	fmt.Fprintln(w)
-	return nil
+	if export {
+		if _, err := fmt.Fprintf(w, "; %s", enc); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprintln(w)
+	return err
 }
 
 var paychVoucherSubmitCmd = &cli.Command{
@@ -602,8 +597,8 @@ var paychVoucherSubmitCmd = &cli.Command{
 	Usage:     "Submit voucher to chain to update payment channel state",
 	ArgsUsage: "[channelAddress voucher]",
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 2 {
-			return ShowHelp(cctx, fmt.Errorf("must pass payment channel address and voucher"))
+		if cctx.NArg() != 2 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		ch, err := address.NewFromString(cctx.Args().Get(0))
@@ -629,16 +624,16 @@ var paychVoucherSubmitCmd = &cli.Command{
 			return err
 		}
 
-		mwait, err := api.StateWaitMsg(ctx, mcid, build.MessageConfidence)
+		mwait, err := api.StateWaitMsg(ctx, mcid, buildconstants.MessageConfidence)
 		if err != nil {
 			return err
 		}
 
-		if mwait.Receipt.ExitCode != 0 {
+		if mwait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("message execution failed (exit code %d)", mwait.Receipt.ExitCode)
 		}
 
-		fmt.Fprintln(cctx.App.Writer, "channel updated successfully")
+		_, _ = fmt.Fprintln(cctx.App.Writer, "channel updated successfully")
 
 		return nil
 	},

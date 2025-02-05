@@ -2,17 +2,24 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
-	"io/ioutil"
+	"io/fs"
 	"os"
+	"path"
 
+	"github.com/mitchellh/go-homedir"
 	"golang.org/x/xerrors"
 
-	"github.com/filecoin-project/lotus/storage/paths"
-	"github.com/filecoin-project/lotus/storage/sealer"
+	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
-func StorageFromFile(path string, def *paths.StorageConfig) (*paths.StorageConfig, error) {
+func StorageFromFile(path string, def *storiface.StorageConfig) (*storiface.StorageConfig, error) {
+	path, err := homedir.Expand(path)
+	if err != nil {
+		return nil, xerrors.Errorf("expanding storage config path: %w", err)
+	}
+
 	file, err := os.Open(path)
 	switch {
 	case os.IsNotExist(err):
@@ -28,8 +35,8 @@ func StorageFromFile(path string, def *paths.StorageConfig) (*paths.StorageConfi
 	return StorageFromReader(file)
 }
 
-func StorageFromReader(reader io.Reader) (*paths.StorageConfig, error) {
-	var cfg paths.StorageConfig
+func StorageFromReader(reader io.Reader) (*storiface.StorageConfig, error) {
+	var cfg storiface.StorageConfig
 	err := json.NewDecoder(reader).Decode(&cfg)
 	if err != nil {
 		return nil, err
@@ -38,35 +45,37 @@ func StorageFromReader(reader io.Reader) (*paths.StorageConfig, error) {
 	return &cfg, nil
 }
 
-func WriteStorageFile(path string, config paths.StorageConfig) error {
+func WriteStorageFile(filePath string, config storiface.StorageConfig) error {
+	filePath, err := homedir.Expand(filePath)
+	if err != nil {
+		return xerrors.Errorf("expanding storage config path: %w", err)
+	}
+
 	b, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return xerrors.Errorf("marshaling storage config: %w", err)
 	}
 
-	if err := ioutil.WriteFile(path, b, 0644); err != nil {
-		return xerrors.Errorf("persisting storage config (%s): %w", path, err)
+	info, err := os.Stat(filePath)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return xerrors.Errorf("statting storage config (%s): %w", filePath, err)
+		}
+		if path.Base(filePath) == "." {
+			filePath = path.Join(filePath, "storage.json")
+		}
+	} else {
+		if info.IsDir() || path.Base(filePath) == "." {
+			filePath = path.Join(filePath, "storage.json")
+		}
+	}
+
+	if err := os.MkdirAll(path.Dir(filePath), 0755); err != nil {
+		return xerrors.Errorf("making storage config parent directory: %w", err)
+	}
+	if err := os.WriteFile(filePath, b, 0644); err != nil {
+		return xerrors.Errorf("persisting storage config (%s): %w", filePath, err)
 	}
 
 	return nil
-}
-
-func (c *StorageMiner) StorageManager() sealer.Config {
-	return sealer.Config{
-		ParallelFetchLimit:       c.Storage.ParallelFetchLimit,
-		AllowAddPiece:            c.Storage.AllowAddPiece,
-		AllowPreCommit1:          c.Storage.AllowPreCommit1,
-		AllowPreCommit2:          c.Storage.AllowPreCommit2,
-		AllowCommit:              c.Storage.AllowCommit,
-		AllowUnseal:              c.Storage.AllowUnseal,
-		AllowReplicaUpdate:       c.Storage.AllowReplicaUpdate,
-		AllowProveReplicaUpdate2: c.Storage.AllowProveReplicaUpdate2,
-		AllowRegenSectorKey:      c.Storage.AllowRegenSectorKey,
-		ResourceFiltering:        c.Storage.ResourceFiltering,
-		DisallowRemoteFinalize:   c.Storage.DisallowRemoteFinalize,
-
-		Assigner: c.Storage.Assigner,
-
-		ParallelCheckLimit: c.Proving.ParallelCheckLimit,
-	}
 }

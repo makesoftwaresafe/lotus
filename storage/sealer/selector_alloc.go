@@ -16,17 +16,19 @@ type allocSelector struct {
 	index paths.SectorIndex
 	alloc storiface.SectorFileType
 	ptype storiface.PathType
+	miner abi.ActorID
 }
 
-func newAllocSelector(index paths.SectorIndex, alloc storiface.SectorFileType, ptype storiface.PathType) *allocSelector {
+func newAllocSelector(index paths.SectorIndex, alloc storiface.SectorFileType, ptype storiface.PathType, miner abi.ActorID) *allocSelector {
 	return &allocSelector{
 		index: index,
 		alloc: alloc,
 		ptype: ptype,
+		miner: miner,
 	}
 }
 
-func (s *allocSelector) Ok(ctx context.Context, task sealtasks.TaskType, spt abi.RegisteredSealProof, whnd *WorkerHandle) (bool, bool, error) {
+func (s *allocSelector) Ok(ctx context.Context, task sealtasks.TaskType, spt abi.RegisteredSealProof, whnd SchedWorker) (bool, bool, error) {
 	tasks, err := whnd.TaskTypes(ctx)
 	if err != nil {
 		return false, false, xerrors.Errorf("getting supported worker task types: %w", err)
@@ -35,7 +37,7 @@ func (s *allocSelector) Ok(ctx context.Context, task sealtasks.TaskType, spt abi
 		return false, false, nil
 	}
 
-	paths, err := whnd.workerRpc.Paths(ctx)
+	paths, err := whnd.Paths(ctx)
 	if err != nil {
 		return false, false, xerrors.Errorf("getting worker paths: %w", err)
 	}
@@ -50,21 +52,28 @@ func (s *allocSelector) Ok(ctx context.Context, task sealtasks.TaskType, spt abi
 		return false, false, xerrors.Errorf("getting sector size: %w", err)
 	}
 
-	best, err := s.index.StorageBestAlloc(ctx, s.alloc, ssize, s.ptype)
+	best, err := s.index.StorageBestAlloc(ctx, s.alloc, ssize, s.ptype, s.miner)
 	if err != nil {
 		return false, false, xerrors.Errorf("finding best alloc storage: %w", err)
 	}
 
+	requested := s.alloc
+
 	for _, info := range best {
 		if _, ok := have[info.ID]; ok {
-			return true, false, nil
+			requested = requested.SubAllowed(info.AllowTypes, info.DenyTypes)
+
+			// got all paths
+			if requested == storiface.FTNone {
+				break
+			}
 		}
 	}
 
-	return false, false, nil
+	return requested == storiface.FTNone, false, nil
 }
 
-func (s *allocSelector) Cmp(ctx context.Context, task sealtasks.TaskType, a, b *WorkerHandle) (bool, error) {
+func (s *allocSelector) Cmp(ctx context.Context, task sealtasks.TaskType, a, b SchedWorker) (bool, error) {
 	return a.Utilization() < b.Utilization(), nil
 }
 

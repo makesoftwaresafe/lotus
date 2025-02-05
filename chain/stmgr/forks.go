@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
+	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/ipfs/go-cid"
+	"github.com/ipfs/go-datastore"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
@@ -17,7 +21,7 @@ import (
 	"github.com/filecoin-project/go-state-types/network"
 	"github.com/filecoin-project/specs-actors/v8/actors/migration/nv16"
 
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
 	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	init_ "github.com/filecoin-project/lotus/chain/actors/builtin/init"
@@ -25,6 +29,9 @@ import (
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/vm"
 )
+
+// EnvDisablePreMigrations when set to '1' stops pre-migrations from running
+const EnvDisablePreMigrations = "LOTUS_DISABLE_PRE_MIGRATIONS"
 
 // MigrationCache can be used to cache information used by a migration. This is primarily useful to
 // "pre-compute" some migration state ahead of time, and make it accessible in the migration itself.
@@ -36,12 +43,12 @@ type MigrationCache interface {
 
 // MigrationFunc is a migration function run at every upgrade.
 //
-// - The cache is a per-upgrade cache, pre-populated by pre-migrations.
-// - The oldState is the state produced by the upgrade epoch.
-// - The returned newState is the new state that will be used by the next epoch.
-// - The height is the upgrade epoch height (already executed).
-// - The tipset is the first non-null tipset after the upgrade height (the tipset in
-//   which the upgrade is executed). Do not assume that ts.Height() is the upgrade height.
+//   - The cache is a per-upgrade cache, pre-populated by pre-migrations.
+//   - The oldState is the state produced by the upgrade epoch.
+//   - The returned newState is the new state that will be used by the next epoch.
+//   - The height is the upgrade epoch height (already executed).
+//   - The tipset is the first non-null tipset after the upgrade height (the tipset in
+//     which the upgrade is executed). Do not assume that ts.Height() is the upgrade height.
 //
 // NOTE: In StateCompute and CallWithGas, the passed tipset is actually the tipset _before_ the
 // upgrade. The tipset should really only be used for referencing the "current chain".
@@ -164,14 +171,33 @@ func (us UpgradeSchedule) GetNtwkVersion(e abi.ChainEpoch) (network.Version, err
 		}
 	}
 
-	return build.GenesisNetworkVersion, nil
+	return buildconstants.GenesisNetworkVersion, nil
 }
 
 func (sm *StateManager) HandleStateForks(ctx context.Context, root cid.Cid, height abi.ChainEpoch, cb ExecMonitor, ts *types.TipSet) (cid.Cid, error) {
 	retCid := root
-	var err error
 	u := sm.stateMigrations[height]
 	if u != nil && u.upgrade != nil {
+		migCid, ok, err := u.migrationResultCache.Get(ctx, root)
+		if err == nil {
+			if ok {
+				log.Infow("CACHED migration", "height", height, "from", root, "to", migCid)
+				foundMigratedRoot, err := sm.ChainStore().StateBlockstore().Has(ctx, migCid)
+				if err != nil {
+					log.Errorw("failed to check whether previous migration result is present", "err", err)
+				} else if !foundMigratedRoot {
+					log.Errorw("cached migration result not found in blockstore, running migration again")
+					u.migrationResultCache.Delete(ctx, root)
+				} else {
+					return migCid, nil
+				}
+			}
+		} else if !errors.Is(err, datastore.ErrNotFound) {
+			log.Errorw("failed to lookup previous migration result", "err", err)
+		} else {
+			log.Debug("no cached migration found, migrating from scratch")
+		}
+
 		startTime := time.Now()
 		log.Warnw("STARTING migration", "height", height, "from", root)
 		// Yes, we clone the cache, even for the final upgrade epoch. Why? Reverts. We may
@@ -182,25 +208,26 @@ func (sm *StateManager) HandleStateForks(ctx context.Context, root cid.Cid, heig
 			log.Errorw("FAILED migration", "height", height, "from", root, "error", err)
 			return cid.Undef, err
 		}
-		// Yes, we update the cache, even for the final upgrade epoch. Why? Reverts. This
-		// can save us a _lot_ of time because very few actors will have changed if we
-		// do a small revert then need to re-run the migration.
-		u.cache.Update(tmpCache)
 		log.Warnw("COMPLETED migration",
 			"height", height,
 			"from", root,
 			"to", retCid,
 			"duration", time.Since(startTime),
 		)
+
+		// Only set if migration ran, we do not want a root => root mapping
+		if err := u.migrationResultCache.Store(ctx, root, retCid); err != nil {
+			log.Errorw("failed to store migration result", "err", err)
+		}
 	}
 
 	return retCid, nil
 }
 
-// Returns true executing tipsets between the specified heights would trigger an expensive
-// migration. NOTE: migrations occurring _at_ the target height are not included, as they're
-// executed _after_ the target height.
-func (sm *StateManager) hasExpensiveForkBetween(parent, height abi.ChainEpoch) bool {
+// HasExpensiveForkBetween returns true where executing tipsets between the specified heights would
+// trigger an expensive migration. NOTE: migrations occurring _at_ the target height are not
+// included, as they're executed _after_ the target height.
+func (sm *StateManager) HasExpensiveForkBetween(parent, height abi.ChainEpoch) bool {
 	for h := parent; h < height; h++ {
 		if _, ok := sm.expensiveUpgrades[h]; ok {
 			return true
@@ -209,14 +236,14 @@ func (sm *StateManager) hasExpensiveForkBetween(parent, height abi.ChainEpoch) b
 	return false
 }
 
-func (sm *StateManager) hasExpensiveFork(height abi.ChainEpoch) bool {
-	_, ok := sm.expensiveUpgrades[height]
-	return ok
-}
-
 func runPreMigration(ctx context.Context, sm *StateManager, fn PreMigrationFunc, cache *nv16.MemMigrationCache, ts *types.TipSet) {
 	height := ts.Height()
 	parent := ts.ParentState()
+
+	if disabled := os.Getenv(EnvDisablePreMigrations); strings.TrimSpace(disabled) == "1" {
+		log.Warnw("SKIPPING pre-migration", "height", height)
+		return
+	}
 
 	startTime := time.Now()
 
@@ -347,12 +374,11 @@ func DoTransfer(tree types.StateTree, from, to address.Address, amt abi.TokenAmo
 		// record the transfer in execution traces
 
 		cb(types.ExecutionTrace{
-			Msg:        MakeFakeMsg(from, to, amt, 0),
-			MsgRct:     MakeFakeRct(),
-			Error:      "",
-			Duration:   0,
-			GasCharges: nil,
-			Subcalls:   nil,
+			Msg: types.MessageTrace{
+				From:  from,
+				To:    to,
+				Value: amt,
+			},
 		})
 	}
 
@@ -361,7 +387,7 @@ func DoTransfer(tree types.StateTree, from, to address.Address, amt abi.TokenAmo
 
 func TerminateActor(ctx context.Context, tree *state.StateTree, addr address.Address, em ExecMonitor, epoch abi.ChainEpoch, ts *types.TipSet) error {
 	a, err := tree.GetActor(addr)
-	if xerrors.Is(err, types.ErrActorNotFound) {
+	if errors.Is(err, types.ErrActorNotFound) {
 		return types.ErrActorNotFound
 	} else if err != nil {
 		return xerrors.Errorf("failed to get actor to delete: %w", err)

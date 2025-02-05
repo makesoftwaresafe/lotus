@@ -1,11 +1,10 @@
-//stm: #unit
 package backupds
 
 import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -37,7 +36,6 @@ func checkVals(t *testing.T, ds datastore.Datastore, start, end int, exist bool)
 }
 
 func TestNoLogRestore(t *testing.T) {
-	//stm: @OTHER_DATASTORE_RESTORE_002
 	ds1 := datastore.NewMapDatastore()
 
 	putVals(t, ds1, 0, 10)
@@ -58,7 +56,6 @@ func TestNoLogRestore(t *testing.T) {
 }
 
 func TestLogRestore(t *testing.T) {
-	//stm: @OTHER_DATASTORE_RESTORE_001
 	logdir := t.TempDir()
 
 	ds1 := datastore.NewMapDatastore()
@@ -72,11 +69,11 @@ func TestLogRestore(t *testing.T) {
 
 	require.NoError(t, bds.Close())
 
-	fls, err := ioutil.ReadDir(logdir)
+	fls, err := os.ReadDir(logdir)
 	require.NoError(t, err)
 	require.Equal(t, 1, len(fls))
 
-	bf, err := ioutil.ReadFile(filepath.Join(logdir, fls[0].Name()))
+	bf, err := os.ReadFile(filepath.Join(logdir, fls[0].Name()))
 	require.NoError(t, err)
 
 	ds2 := datastore.NewMapDatastore()

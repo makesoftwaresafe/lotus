@@ -59,6 +59,9 @@ out:
 	if err != nil {
 		return xerrors.Errorf("getting sector info: %w", err)
 	}
+	if si == nil {
+		return xerrors.Errorf("sector not found %d", sector)
+	}
 
 	ts, err := m.api.ChainHead(ctx)
 	if err != nil {
@@ -81,7 +84,7 @@ out:
 		return xerrors.Errorf("failed to compute proof: %w", err)
 	}
 
-	log.Infow("winning PoSt warmup successful", "took", time.Now().Sub(start))
+	log.Infow("winning PoSt warmup successful", "took", time.Since(start))
 	return nil
 }
 

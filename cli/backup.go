@@ -24,7 +24,7 @@ type BackupApiFn func(ctx *cli.Context) (BackupAPI, jsonrpc.ClientCloser, error)
 
 func BackupCmd(repoFlag string, rt repo.RepoType, getApi BackupApiFn) *cli.Command {
 	var offlineBackup = func(cctx *cli.Context) error {
-		logging.SetLogLevel("badger", "ERROR") // nolint:errcheck
+		_ = logging.SetLogLevel("badger", "ERROR")
 
 		repoPath := cctx.String(repoFlag)
 		r, err := repo.NewFS(repoPath)
@@ -61,6 +61,10 @@ func BackupCmd(repoFlag string, rt repo.RepoType, getApi BackupApiFn) *cli.Comma
 			return xerrors.Errorf("expanding file path: %w", err)
 		}
 
+		if _, err := os.Stat(fpath); !os.IsNotExist(err) {
+			return xerrors.Errorf("backup file %s already exists. Overwriting it will corrupt the file, please specify another file name", fpath)
+		}
+
 		out, err := os.OpenFile(fpath, os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			return xerrors.Errorf("opening backup file %s: %w", fpath, err)
@@ -87,7 +91,12 @@ func BackupCmd(repoFlag string, rt repo.RepoType, getApi BackupApiFn) *cli.Comma
 		}
 		defer closer()
 
-		err = api.CreateBackup(ReqContext(cctx), cctx.Args().First())
+		backupPath := cctx.Args().First()
+		if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
+			return xerrors.Errorf("backup file %s already exists. Overwriting it will corrupt the file, please specify another file name", backupPath)
+		}
+
+		err = api.CreateBackup(ReqContext(cctx), backupPath)
 		if err != nil {
 			return err
 		}
@@ -103,7 +112,7 @@ func BackupCmd(repoFlag string, rt repo.RepoType, getApi BackupApiFn) *cli.Comma
 		Description: `The backup command writes a copy of node metadata under the specified path
 
 Online backups:
-For security reasons, the daemon must be have LOTUS_BACKUP_BASE_PATH env var set
+For security reasons, the daemon must have LOTUS_BACKUP_BASE_PATH env var set
 to a path where backup files are supposed to be saved, and the path specified in
 this command must be within this base path`,
 		Flags: []cli.Flag{
@@ -114,8 +123,8 @@ this command must be within this base path`,
 		},
 		ArgsUsage: "[backup file path]",
 		Action: func(cctx *cli.Context) error {
-			if cctx.Args().Len() != 1 {
-				return xerrors.Errorf("expected 1 argument")
+			if cctx.NArg() != 1 {
+				return IncorrectNumArgs(cctx)
 			}
 
 			if cctx.Bool("offline") {

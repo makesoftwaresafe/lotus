@@ -7,8 +7,10 @@ import (
 	"io"
 	"strings"
 
+	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	typegen "github.com/whyrusleeping/cbor-gen"
+	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-state-types/abi"
 )
@@ -35,7 +37,7 @@ func init() {
 type TipSetKey struct {
 	// The internal representation is a concatenation of the bytes of the CIDs, which are
 	// self-describing, wrapped as a string.
-	// These gymnastics make the a TipSetKey usable as a map key.
+	// These gymnastics make a TipSetKey usable as a map key.
 	// The empty key has value "".
 	value string
 }
@@ -51,7 +53,7 @@ func NewTipSetKey(cids ...cid.Cid) TipSetKey {
 func TipSetKeyFromBytes(encoded []byte) (TipSetKey, error) {
 	_, err := decodeKey(encoded)
 	if err != nil {
-		return EmptyTSK, err
+		return EmptyTSK, xerrors.Errorf("decoding tpiset key: %w", err)
 	}
 	return TipSetKey{string(encoded)}, nil
 }
@@ -80,7 +82,7 @@ func (k TipSetKey) String() string {
 	return b.String()
 }
 
-// Bytes() returns a binary representation of the key.
+// Bytes returns a binary representation of the key.
 func (k TipSetKey) Bytes() []byte {
 	return []byte(k.value)
 }
@@ -96,6 +98,28 @@ func (k *TipSetKey) UnmarshalJSON(b []byte) error {
 	}
 	k.value = string(encodeKey(cids))
 	return nil
+}
+
+func (k TipSetKey) Cid() (cid.Cid, error) {
+	blk, err := k.ToStorageBlock()
+	if err != nil {
+		return cid.Cid{}, err
+	}
+	return blk.Cid(), nil
+}
+
+func (k TipSetKey) ToStorageBlock() (block.Block, error) {
+	buf := new(bytes.Buffer)
+	if err := k.MarshalCBOR(buf); err != nil {
+		log.Errorf("failed to marshal ts key as CBOR: %s", k)
+	}
+
+	cid, err := abi.CidBuilder.Sum(buf.Bytes())
+	if err != nil {
+		return nil, err
+	}
+
+	return block.NewBlockWithCid(buf.Bytes(), cid)
 }
 
 func (k TipSetKey) MarshalCBOR(writer io.Writer) error {

@@ -2,6 +2,7 @@ package market
 
 import (
 	"bytes"
+	"fmt"
 
 	"github.com/ipfs/go-cid"
 	cbg "github.com/whyrusleeping/cbor-gen"
@@ -11,10 +12,16 @@ import (
 	"github.com/filecoin-project/go-bitfield"
 	rlepluslazy "github.com/filecoin-project/go-bitfield/rle"
 	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+	"github.com/filecoin-project/go-state-types/builtin"
 	market8 "github.com/filecoin-project/go-state-types/builtin/v8/market"
 	adt8 "github.com/filecoin-project/go-state-types/builtin/v8/util/adt"
+	markettypes "github.com/filecoin-project/go-state-types/builtin/v9/market"
+	"github.com/filecoin-project/go-state-types/manifest"
 
+	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
+	verifregtypes "github.com/filecoin-project/lotus/chain/actors/builtin/verifreg"
 	"github.com/filecoin-project/lotus/chain/types"
 )
 
@@ -99,6 +106,14 @@ func (s *state8) Proposals() (DealProposals, error) {
 	return &dealProposals8{proposalArray}, nil
 }
 
+func (s *state8) PendingProposals() (PendingProposals, error) {
+	proposalCidSet, err := adt8.AsSet(s.store, s.State.PendingProposals, builtin.DefaultHamtBitwidth)
+	if err != nil {
+		return nil, err
+	}
+	return &pendingProposals8{proposalCidSet}, nil
+}
+
 func (s *state8) EscrowTable() (BalanceTable, error) {
 	bt, err := adt8.AsBalanceTable(s.store, s.State.EscrowTable)
 	if err != nil {
@@ -117,9 +132,9 @@ func (s *state8) LockedTable() (BalanceTable, error) {
 
 func (s *state8) VerifyDealsForActivation(
 	minerAddr address.Address, deals []abi.DealID, currEpoch, sectorExpiry abi.ChainEpoch,
-) (weight, verifiedWeight abi.DealWeight, err error) {
-	w, vw, _, err := market8.ValidateDealsForActivation(&s.State, s.store, deals, minerAddr, sectorExpiry, currEpoch)
-	return w, vw, err
+) (verifiedWeight abi.DealWeight, err error) {
+	_, vw, _, err := market8.ValidateDealsForActivation(&s.State, s.store, deals, minerAddr, sectorExpiry, currEpoch)
+	return vw, err
 }
 
 func (s *state8) NextID() (abi.DealID, error) {
@@ -146,7 +161,7 @@ type dealStates8 struct {
 	adt.Array
 }
 
-func (s *dealStates8) Get(dealID abi.DealID) (*DealState, bool, error) {
+func (s *dealStates8) Get(dealID abi.DealID) (DealState, bool, error) {
 	var deal8 market8.DealState
 	found, err := s.Array.Get(uint64(dealID), &deal8)
 	if err != nil {
@@ -156,7 +171,7 @@ func (s *dealStates8) Get(dealID abi.DealID) (*DealState, bool, error) {
 		return nil, false, nil
 	}
 	deal := fromV8DealState(deal8)
-	return &deal, true, nil
+	return deal, true, nil
 }
 
 func (s *dealStates8) ForEach(cb func(dealID abi.DealID, ds DealState) error) error {
@@ -166,21 +181,63 @@ func (s *dealStates8) ForEach(cb func(dealID abi.DealID, ds DealState) error) er
 	})
 }
 
-func (s *dealStates8) decode(val *cbg.Deferred) (*DealState, error) {
+func (s *dealStates8) decode(val *cbg.Deferred) (DealState, error) {
 	var ds8 market8.DealState
 	if err := ds8.UnmarshalCBOR(bytes.NewReader(val.Raw)); err != nil {
 		return nil, err
 	}
 	ds := fromV8DealState(ds8)
-	return &ds, nil
+	return ds, nil
 }
 
 func (s *dealStates8) array() adt.Array {
 	return s.Array
 }
 
+type dealStateV8 struct {
+	ds8 market8.DealState
+}
+
+func (d dealStateV8) SectorNumber() abi.SectorNumber {
+
+	return 0
+
+}
+
+func (d dealStateV8) SectorStartEpoch() abi.ChainEpoch {
+	return d.ds8.SectorStartEpoch
+}
+
+func (d dealStateV8) LastUpdatedEpoch() abi.ChainEpoch {
+	return d.ds8.LastUpdatedEpoch
+}
+
+func (d dealStateV8) SlashEpoch() abi.ChainEpoch {
+	return d.ds8.SlashEpoch
+}
+
+func (d dealStateV8) Equals(other DealState) bool {
+	if ov8, ok := other.(dealStateV8); ok {
+		return d.ds8 == ov8.ds8
+	}
+
+	if d.SectorStartEpoch() != other.SectorStartEpoch() {
+		return false
+	}
+	if d.LastUpdatedEpoch() != other.LastUpdatedEpoch() {
+		return false
+	}
+	if d.SlashEpoch() != other.SlashEpoch() {
+		return false
+	}
+
+	return true
+}
+
+var _ DealState = (*dealStateV8)(nil)
+
 func fromV8DealState(v8 market8.DealState) DealState {
-	return (DealState)(v8)
+	return dealStateV8{v8}
 }
 
 type dealProposals8 struct {
@@ -235,9 +292,21 @@ func (s *dealProposals8) array() adt.Array {
 	return s.Array
 }
 
+type pendingProposals8 struct {
+	*adt8.Set
+}
+
+func (s *pendingProposals8) Has(proposalCid cid.Cid) (bool, error) {
+	return s.Set.Has(abi.CidKey(proposalCid))
+}
+
 func fromV8DealProposal(v8 market8.DealProposal) (DealProposal, error) {
 
-	label := v8.Label
+	label, err := fromV8Label(v8.Label)
+
+	if err != nil {
+		return DealProposal{}, xerrors.Errorf("error setting deal label: %w", err)
+	}
 
 	return DealProposal{
 		PieceCID:     v8.PieceCID,
@@ -255,6 +324,22 @@ func fromV8DealProposal(v8 market8.DealProposal) (DealProposal, error) {
 		ProviderCollateral: v8.ProviderCollateral,
 		ClientCollateral:   v8.ClientCollateral,
 	}, nil
+}
+
+func fromV8Label(v8 market8.DealLabel) (DealLabel, error) {
+	if v8.IsString() {
+		str, err := v8.ToString()
+		if err != nil {
+			return markettypes.EmptyDealLabel, xerrors.Errorf("failed to convert string label to string: %w", err)
+		}
+		return markettypes.NewLabelFromString(str)
+	}
+
+	bs, err := v8.ToBytes()
+	if err != nil {
+		return markettypes.EmptyDealLabel, xerrors.Errorf("failed to convert bytes label to bytes: %w", err)
+	}
+	return markettypes.NewLabelFromBytes(bs)
 }
 
 func (s *state8) GetState() interface{} {
@@ -301,4 +386,27 @@ func (r *publishStorageDealsReturn8) IsDealValid(index uint64) (bool, int, error
 
 func (r *publishStorageDealsReturn8) DealIDs() ([]abi.DealID, error) {
 	return r.IDs, nil
+}
+
+func (s *state8) GetAllocationIdForPendingDeal(dealId abi.DealID) (verifregtypes.AllocationId, error) {
+
+	return verifregtypes.NoAllocationID, xerrors.Errorf("unsupported before actors v9")
+
+}
+
+func (s *state8) ActorKey() string {
+	return manifest.MarketKey
+}
+
+func (s *state8) ActorVersion() actorstypes.Version {
+	return actorstypes.Version8
+}
+
+func (s *state8) Code() cid.Cid {
+	code, ok := actors.GetActorCodeID(s.ActorVersion(), s.ActorKey())
+	if !ok {
+		panic(fmt.Errorf("didn't find actor %v code id for actor version %d", s.ActorKey(), s.ActorVersion()))
+	}
+
+	return code
 }

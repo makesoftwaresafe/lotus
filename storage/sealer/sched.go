@@ -10,6 +10,7 @@ import (
 
 	"github.com/filecoin-project/go-state-types/abi"
 
+	"github.com/filecoin-project/lotus/metrics"
 	"github.com/filecoin-project/lotus/storage/sealer/sealtasks"
 	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
@@ -41,16 +42,28 @@ func WithPriority(ctx context.Context, priority int) context.Context {
 const mib = 1 << 20
 
 type WorkerAction func(ctx context.Context, w Worker) error
+type PrepareAction struct {
+	Action   WorkerAction
+	PrepType sealtasks.TaskType
+}
+
+type SchedWorker interface {
+	TaskTypes(context.Context) (map[sealtasks.TaskType]struct{}, error)
+	Paths(context.Context) ([]storiface.StoragePath, error)
+	Utilization() float64
+}
 
 type WorkerSelector interface {
 	// Ok is true if worker is acceptable for performing a task.
 	// If any worker is preferred for a task, other workers won't be considered for that task.
-	Ok(ctx context.Context, task sealtasks.TaskType, spt abi.RegisteredSealProof, a *WorkerHandle) (ok, preferred bool, err error)
+	Ok(ctx context.Context, task sealtasks.TaskType, spt abi.RegisteredSealProof, a SchedWorker) (ok, preferred bool, err error)
 
-	Cmp(ctx context.Context, task sealtasks.TaskType, a, b *WorkerHandle) (bool, error) // true if a is preferred over b
+	Cmp(ctx context.Context, task sealtasks.TaskType, a, b SchedWorker) (bool, error) // true if a is preferred over b
 }
 
 type Scheduler struct {
+	mctx context.Context // metrics context
+
 	assigner Assigner
 
 	workersLk sync.RWMutex
@@ -68,7 +81,8 @@ type Scheduler struct {
 
 	workTracker *workTracker
 
-	info chan func(interface{})
+	info      chan func(interface{})
+	rmRequest chan *rmRequest
 
 	closing  chan struct{}
 	closed   chan struct{}
@@ -77,10 +91,6 @@ type Scheduler struct {
 
 type WorkerHandle struct {
 	workerRpc Worker
-
-	tasksCache  map[sealtasks.TaskType]struct{}
-	tasksUpdate time.Time
-	tasksLk     sync.Mutex
 
 	Info storiface.WorkerInfo
 
@@ -122,8 +132,9 @@ type WorkerRequest struct {
 	TaskType sealtasks.TaskType
 	Priority int // larger values more important
 	Sel      WorkerSelector
+	SchedId  uuid.UUID
 
-	prepare WorkerAction
+	prepare PrepareAction
 	work    WorkerAction
 
 	start time.Time
@@ -139,18 +150,32 @@ type workerResponse struct {
 	err error
 }
 
-func newScheduler(assigner string) (*Scheduler, error) {
+type rmRequest struct {
+	id  uuid.UUID
+	res chan error
+}
+
+func newScheduler(ctx context.Context, assigner string) (*Scheduler, error) {
 	var a Assigner
 	switch assigner {
 	case "", "utilization":
 		a = NewLowestUtilizationAssigner()
 	case "spread":
-		a = NewSpreadAssigner()
+		a = NewSpreadAssigner(false)
+	case "experiment-spread-qcount":
+		a = NewSpreadAssigner(true)
+	case "experiment-spread-tasks":
+		a = NewSpreadTasksAssigner(false)
+	case "experiment-spread-tasks-qcount":
+		a = NewSpreadTasksAssigner(true)
+	case "experiment-random":
+		a = NewRandomAssigner()
 	default:
 		return nil, xerrors.Errorf("unknown assigner '%s'", assigner)
 	}
 
 	return &Scheduler{
+		mctx:     ctx,
 		assigner: a,
 
 		Workers: map[storiface.WorkerID]*WorkerHandle{},
@@ -168,14 +193,15 @@ func newScheduler(assigner string) (*Scheduler, error) {
 			prepared: map[uuid.UUID]trackedWork{},
 		},
 
-		info: make(chan func(interface{})),
+		info:      make(chan func(interface{})),
+		rmRequest: make(chan *rmRequest),
 
 		closing: make(chan struct{}),
 		closed:  make(chan struct{}),
 	}, nil
 }
 
-func (sh *Scheduler) Schedule(ctx context.Context, sector storiface.SectorRef, taskType sealtasks.TaskType, sel WorkerSelector, prepare WorkerAction, work WorkerAction) error {
+func (sh *Scheduler) Schedule(ctx context.Context, sector storiface.SectorRef, taskType sealtasks.TaskType, sel WorkerSelector, prepare PrepareAction, work WorkerAction) error {
 	ret := make(chan workerResponse)
 
 	select {
@@ -184,6 +210,7 @@ func (sh *Scheduler) Schedule(ctx context.Context, sector storiface.SectorRef, t
 		TaskType: taskType,
 		Priority: getPriority(ctx),
 		Sel:      sel,
+		SchedId:  uuid.New(),
 
 		prepare: prepare,
 		work:    work,
@@ -224,10 +251,18 @@ func (r *WorkerRequest) SealTask() sealtasks.SealTaskType {
 	}
 }
 
+func (r *WorkerRequest) PrepSealTask() sealtasks.SealTaskType {
+	return sealtasks.SealTaskType{
+		TaskType:            r.prepare.PrepType,
+		RegisteredSealProof: r.Sector.ProofType,
+	}
+}
+
 type SchedDiagRequestInfo struct {
 	Sector   abi.SectorID
 	TaskType sealtasks.TaskType
 	Priority int
+	SchedId  uuid.UUID
 }
 
 type SchedDiagInfo struct {
@@ -246,6 +281,9 @@ func (sh *Scheduler) runSched() {
 		var toDisable []workerDisableReq
 
 		select {
+		case rmreq := <-sh.rmRequest:
+			sh.removeRequest(rmreq)
+			doSched = true
 		case <-sh.workerChange:
 			doSched = true
 		case dreq := <-sh.workerDisable:
@@ -263,7 +301,6 @@ func (sh *Scheduler) runSched() {
 			doSched = true
 		case ireq := <-sh.info:
 			ireq(sh.diag())
-
 		case <-iw:
 			initialised = true
 			iw = nil
@@ -332,6 +369,7 @@ func (sh *Scheduler) diag() SchedDiagInfo {
 			Sector:   task.Sector.ID,
 			TaskType: task.TaskType,
 			Priority: task.Priority,
+			SchedId:  task.SchedId,
 		})
 	}
 
@@ -352,6 +390,9 @@ type Assigner interface {
 func (sh *Scheduler) trySched() {
 	sh.workersLk.RLock()
 	defer sh.workersLk.RUnlock()
+
+	done := metrics.Timer(sh.mctx, metrics.SchedAssignerCycleDuration)
+	defer done()
 
 	sh.assigner.TrySched(sh)
 }
@@ -378,6 +419,49 @@ func (sh *Scheduler) Info(ctx context.Context) (interface{}, error) {
 		return res, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+}
+
+func (sh *Scheduler) removeRequest(rmrequest *rmRequest) {
+
+	if sh.SchedQueue.Len() < 0 {
+		rmrequest.res <- xerrors.New("No requests in the scheduler")
+		return
+	}
+
+	queue := sh.SchedQueue
+	for i, r := range *queue {
+		if r.SchedId == rmrequest.id {
+			queue.Remove(i)
+			rmrequest.res <- nil
+			go r.respond(xerrors.Errorf("scheduling request removed"))
+			return
+		}
+	}
+	rmrequest.res <- xerrors.New("No request with provided details found")
+}
+
+func (sh *Scheduler) RemoveRequest(ctx context.Context, schedId uuid.UUID) error {
+	ret := make(chan error, 1)
+
+	select {
+	case sh.rmRequest <- &rmRequest{
+		id:  schedId,
+		res: ret,
+	}:
+	case <-sh.closing:
+		return xerrors.New("closing")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	select {
+	case resp := <-ret:
+		return resp
+	case <-sh.closing:
+		return xerrors.New("closing")
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

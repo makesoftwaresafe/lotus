@@ -9,7 +9,7 @@ import (
 	"github.com/filecoin-project/go-statemachine"
 
 	"github.com/filecoin-project/lotus/api"
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/actors/policy"
 	"github.com/filecoin-project/lotus/chain/types"
 )
@@ -26,7 +26,7 @@ func (m *Sealing) handleFaultReported(ctx statemachine.Context, sector SectorInf
 		return xerrors.Errorf("entered fault reported state without a FaultReportMsg cid")
 	}
 
-	mw, err := m.Api.StateWaitMsg(ctx.Context(), *sector.FaultReportMsg, build.MessageConfidence, api.LookbackNoLimit, true)
+	mw, err := m.Api.StateWaitMsg(ctx.Context(), *sector.FaultReportMsg, buildconstants.MessageConfidence, api.LookbackNoLimit, true)
 	if err != nil {
 		return xerrors.Errorf("failed to wait for fault declaration: %w", err)
 	}
@@ -81,10 +81,15 @@ func (m *Sealing) handleTerminating(ctx statemachine.Context, sector SectorInfo)
 
 func (m *Sealing) handleTerminateWait(ctx statemachine.Context, sector SectorInfo) error {
 	if sector.TerminateMessage == nil {
-		return xerrors.New("entered TerminateWait with nil TerminateMessage")
+		ts, err := m.Api.ChainHead(ctx.Context())
+		if err != nil {
+			return ctx.Send(SectorTerminateFailed{xerrors.Errorf("getting chain head: %w", err)})
+		}
+
+		return ctx.Send(SectorTerminated{TerminatedAt: ts.Height()})
 	}
 
-	mw, err := m.Api.StateWaitMsg(ctx.Context(), *sector.TerminateMessage, build.MessageConfidence, api.LookbackNoLimit, true)
+	mw, err := m.Api.StateWaitMsg(ctx.Context(), *sector.TerminateMessage, buildconstants.MessageConfidence, api.LookbackNoLimit, true)
 	if err != nil {
 		return ctx.Send(SectorTerminateFailed{xerrors.Errorf("waiting for terminate message to land on chain: %w", err)})
 	}
@@ -112,7 +117,7 @@ func (m *Sealing) handleTerminateFinality(ctx statemachine.Context, sector Secto
 			return ctx.Send(SectorRemove{})
 		}
 
-		toWait := time.Duration(ts.Height()-sector.TerminatedAt+policy.GetWinningPoStSectorSetLookback(nv)) * time.Duration(build.BlockDelaySecs) * time.Second
+		toWait := time.Duration(ts.Height()-sector.TerminatedAt+policy.GetWinningPoStSectorSetLookback(nv)) * time.Duration(buildconstants.BlockDelaySecs) * time.Second
 		select {
 		case <-time.After(toWait):
 			continue
@@ -137,6 +142,12 @@ func (m *Sealing) handleProvingSector(ctx statemachine.Context, sector SectorInf
 	// in case we revert into Proving without going into Available
 	delete(m.available, m.minerSectorID(sector.SectorNumber))
 	m.inputLk.Unlock()
+
+	// guard against manual state updates from snap-deals states into Proving
+	// note: normally snap deals should be aborted through the abort command, but
+	// apparently sometimes some SPs would use update-state to force the sector back
+	// into the Proving state, breaking the deal input pipeline in the process.
+	m.cleanupAssignedDeals(sector)
 
 	// TODO: Watch termination
 	// TODO: Auto-extend if set

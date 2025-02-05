@@ -3,21 +3,20 @@ package fr32_test
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	ffi "github.com/filecoin-project/filecoin-ffi"
-	commpffi "github.com/filecoin-project/go-commp-utils/ffiwrapper"
 	"github.com/filecoin-project/go-state-types/abi"
 
 	"github.com/filecoin-project/lotus/storage/sealer/fr32"
+	"github.com/filecoin-project/lotus/storage/sealer/mock"
 )
 
 func TestWriteTwoPcs(t *testing.T) {
-	tf, _ := ioutil.TempFile("/tmp/", "scrb-")
+	tf, _ := os.CreateTemp("/tmp/", "scrb-")
 
 	paddedSize := abi.PaddedPieceSize(16 << 20)
 	n := 2
@@ -28,7 +27,7 @@ func TestWriteTwoPcs(t *testing.T) {
 		buf := bytes.Repeat([]byte{0xab * byte(i)}, int(paddedSize.Unpadded()))
 		rawBytes = append(rawBytes, buf...)
 
-		rf, w, _ := commpffi.ToReadableFile(bytes.NewReader(buf), int64(len(buf)))
+		rf, w, _ := mock.ToReadableFile(bytes.NewReader(buf), int64(len(buf)))
 
 		_, _, _, err := ffi.WriteWithAlignment(abi.RegisteredSealProof_StackedDrg32GiBV1, rf, abi.UnpaddedPieceSize(len(buf)), tf, nil)
 		if err != nil {
@@ -43,7 +42,7 @@ func TestWriteTwoPcs(t *testing.T) {
 		panic(err)
 	}
 
-	ffiBytes, err := ioutil.ReadAll(tf)
+	ffiBytes, err := io.ReadAll(tf)
 	if err != nil {
 		panic(err)
 	}

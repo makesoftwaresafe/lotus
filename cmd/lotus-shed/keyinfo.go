@@ -7,14 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"strings"
 	"text/template"
 
-	"github.com/libp2p/go-libp2p-core/crypto"
-	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-base32"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
@@ -23,6 +22,7 @@ import (
 	"github.com/filecoin-project/lotus/chain/wallet"
 	"github.com/filecoin-project/lotus/chain/wallet/key"
 	_ "github.com/filecoin-project/lotus/lib/sigs/bls"
+	_ "github.com/filecoin-project/lotus/lib/sigs/delegated"
 	_ "github.com/filecoin-project/lotus/lib/sigs/secp"
 	"github.com/filecoin-project/lotus/node/modules"
 	"github.com/filecoin-project/lotus/node/modules/lp2p"
@@ -67,7 +67,7 @@ var keyinfoVerifyCmd = &cli.Command{
 		defer inputFile.Close() //nolint:errcheck
 		input := bufio.NewReader(inputFile)
 
-		keyContent, err := ioutil.ReadAll(input)
+		keyContent, err := io.ReadAll(input)
 		if err != nil {
 			return err
 		}
@@ -113,7 +113,7 @@ var keyinfoVerifyCmd = &cli.Command{
 			}
 
 			if len(list) != 1 {
-				return fmt.Errorf("Unexpected number of keys, expected 1, found %d", len(list))
+				return fmt.Errorf("unexpected number of keys, expected 1, found %d", len(list))
 			}
 
 			name, err := base32.RawStdEncoding.DecodeString(fileName)
@@ -127,7 +127,7 @@ var keyinfoVerifyCmd = &cli.Command{
 
 			break
 		default:
-			return fmt.Errorf("Unknown keytype %s", keyInfo.Type)
+			return fmt.Errorf("unknown keytype %s", keyInfo.Type)
 		}
 
 		return nil
@@ -149,7 +149,7 @@ var keyinfoImportCmd = &cli.Command{
 		flagRepo := cctx.String("repo")
 
 		var input io.Reader
-		if cctx.Args().Len() == 0 {
+		if cctx.NArg() == 0 {
 			input = os.Stdin
 		} else {
 			var err error
@@ -161,7 +161,7 @@ var keyinfoImportCmd = &cli.Command{
 			input = bufio.NewReader(inputFile)
 		}
 
-		encoded, err := ioutil.ReadAll(input)
+		encoded, err := io.ReadAll(input)
 		if err != nil {
 			return err
 		}
@@ -261,7 +261,7 @@ var keyinfoInfoCmd = &cli.Command{
 		format := cctx.String("format")
 
 		var input io.Reader
-		if cctx.Args().Len() == 0 {
+		if cctx.NArg() == 0 {
 			input = os.Stdin
 		} else {
 			var err error
@@ -273,7 +273,7 @@ var keyinfoInfoCmd = &cli.Command{
 			input = bufio.NewReader(inputFile)
 		}
 
-		encoded, err := ioutil.ReadAll(input)
+		encoded, err := io.ReadAll(input)
 		if err != nil {
 			return err
 		}

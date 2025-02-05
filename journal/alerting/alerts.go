@@ -95,7 +95,7 @@ func (a *Alerting) update(at AlertType, message interface{}, upd func(Alert, jso
 		}{
 			AlertError: err.Error(),
 		})
-		log.Errorw("marshaling marshaling error failed", "type", at, "error", err)
+		log.Errorw("marshaling error failed", "type", at, "error", err)
 	}
 
 	a.alerts[at] = upd(alert, rawMsg)
@@ -159,4 +159,11 @@ func (a *Alerting) GetAlerts() []Alert {
 	})
 
 	return out
+}
+
+func (a *Alerting) IsRaised(at AlertType) bool {
+	a.lk.Lock()
+	defer a.lk.Unlock()
+
+	return a.alerts[at].Active
 }

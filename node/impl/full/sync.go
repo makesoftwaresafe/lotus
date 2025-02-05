@@ -2,6 +2,7 @@ package full
 
 import (
 	"context"
+	"os"
 	"sync/atomic"
 
 	"github.com/ipfs/go-cid"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain"
 	"github.com/filecoin-project/lotus/chain/gen/slashfilter"
 	"github.com/filecoin-project/lotus/chain/types"
@@ -56,10 +58,17 @@ func (a *SyncAPI) SyncSubmitBlock(ctx context.Context, blk *types.BlockMsg) erro
 		return xerrors.Errorf("loading parent block: %w", err)
 	}
 
-	if a.SlashFilter != nil {
-		if err := a.SlashFilter.MinedBlock(ctx, blk.Header, parent.Height); err != nil {
-			log.Errorf("<!!> SLASH FILTER ERROR: %s", err)
-			return xerrors.Errorf("<!!> SLASH FILTER ERROR: %w", err)
+	if a.SlashFilter != nil && os.Getenv("LOTUS_NO_SLASHFILTER") != "_yes_i_know_i_can_and_probably_will_lose_all_my_fil_and_power_" && !buildconstants.IsNearUpgrade(blk.Header.Height, buildconstants.UpgradeWatermelonFixHeight) {
+		witness, fault, err := a.SlashFilter.MinedBlock(ctx, blk.Header, parent.Height)
+		if err != nil {
+			log.Errorf("<!!> SLASH FILTER ERRORED: %s", err)
+			// Return an error here, because it's _probably_ wiser to not submit this block
+			return xerrors.Errorf("<!!> SLASH FILTER ERRORED: %w", err)
+		}
+
+		if fault {
+			log.Errorf("<!!> SLASH FILTER DETECTED FAULT due to witness %s", witness)
+			return xerrors.Errorf("<!!> SLASH FILTER DETECTED FAULT due to witness %s", witness)
 		}
 	}
 

@@ -1,10 +1,20 @@
 package kit
 
 import (
+	"math"
+	"time"
+
+	"github.com/libp2p/go-libp2p/core/connmgr"
+	"github.com/libp2p/go-libp2p/core/peer"
+	multiaddr "github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
+
+	"github.com/filecoin-project/go-f3/manifest"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
 
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
+	"github.com/filecoin-project/lotus/chain/lf3"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/wallet/key"
 	"github.com/filecoin-project/lotus/node"
@@ -23,6 +33,7 @@ import (
 const DefaultPresealsPerBootstrapMiner = 2
 
 const TestSpt = abi.RegisteredSealProof_StackedDrg2KiBV1_1
+const TestSptNi = abi.RegisteredSealProof_StackedDrg2KiBV1_2_Feat_NiPoRep
 
 // nodeOpts is an options accumulating struct, where functional options are
 // merged into.
@@ -33,28 +44,73 @@ type nodeOpts struct {
 	rpc           bool
 	ownerKey      *key.Key
 	extraNodeOpts []node.Option
+	cfgOpts       []CfgOption
+	fsrepo        bool
 
 	subsystems             MinerSubsystem
 	mainMiner              *TestMiner
 	disableLibp2p          bool
 	optBuilders            []OptBuilder
 	sectorSize             abi.SectorSize
-	maxStagingDealsBytes   int64
 	minerNoLocalSealing    bool // use worker
 	minerAssigner          string
 	disallowRemoteFinalize bool
+	noStorage              bool
 
 	workerTasks      []sealtasks.TaskType
 	workerStorageOpt func(paths.Store) paths.Store
+	workerName       string
 }
+
+// Libp2p connection gater that only allows outbound connections to loopback addresses.
+type loopbackConnGater struct{ connmgr.ConnectionGater }
+
+// InterceptAddrDial implements connmgr.ConnectionGater.
+func (l *loopbackConnGater) InterceptAddrDial(p peer.ID, a multiaddr.Multiaddr) (allow bool) {
+	if !l.ConnectionGater.InterceptAddrDial(p, a) {
+		return false
+	}
+	ip, err := manet.ToIP(a)
+	if err != nil {
+		return false
+	}
+	return ip.IsLoopback()
+}
+
+var _ connmgr.ConnectionGater = (*loopbackConnGater)(nil)
 
 // DefaultNodeOpts are the default options that will be applied to test nodes.
 var DefaultNodeOpts = nodeOpts{
-	balance:    big.Mul(big.NewInt(100000000), types.NewInt(build.FilecoinPrecision)),
+	balance:    big.Mul(big.NewInt(100000000), types.NewInt(buildconstants.FilecoinPrecision)),
 	sectors:    DefaultPresealsPerBootstrapMiner,
 	sectorSize: abi.SectorSize(2 << 10), // 2KiB.
 
-	workerTasks:      []sealtasks.TaskType{sealtasks.TTFetch, sealtasks.TTCommit1, sealtasks.TTFinalize},
+	cfgOpts: []CfgOption{
+		func(cfg *config.FullNode) error {
+			// test defaults
+
+			cfg.Fevm.EnableEthRPC = true
+			cfg.ChainIndexer.EnableIndexer = true
+			cfg.Events.MaxFilterHeightRange = math.MaxInt64
+			cfg.Events.EnableActorEventsAPI = true
+
+			// Disable external networking ffs.
+			cfg.Libp2p.ListenAddresses = []string{
+				"/ip4/127.0.0.1/udp/0/quic-v1",
+			}
+			cfg.Libp2p.DisableNatPortMap = true
+
+			// Nerf the connection manager.
+			cfg.Libp2p.ConnMgrLow = 1024
+			cfg.Libp2p.ConnMgrHigh = 2048
+			cfg.Libp2p.ConnMgrGrace = config.Duration(time.Hour)
+			cfg.ChainIndexer.ReconcileEmptyIndex = true
+			cfg.ChainIndexer.MaxReconcileTipsets = 10000
+			return nil
+		},
+	},
+
+	workerTasks:      []sealtasks.TaskType{sealtasks.TTFetch, sealtasks.TTCommit1, sealtasks.TTFinalize, sealtasks.TTFinalizeUnsealed},
 	workerStorageOpt: func(store paths.Store) paths.Store { return store },
 }
 
@@ -67,7 +123,6 @@ type NodeOpt func(opts *nodeOpts) error
 
 func WithAllSubsystems() NodeOpt {
 	return func(opts *nodeOpts) error {
-		opts.subsystems = opts.subsystems.Add(SMarkets)
 		opts.subsystems = opts.subsystems.Add(SMining)
 		opts.subsystems = opts.subsystems.Add(SSealing)
 		opts.subsystems = opts.subsystems.Add(SSectorStorage)
@@ -84,14 +139,6 @@ func WithSubsystems(systems ...MinerSubsystem) NodeOpt {
 		return nil
 	}
 }
-
-func WithMaxStagingDealsBytes(size int64) NodeOpt {
-	return func(opts *nodeOpts) error {
-		opts.maxStagingDealsBytes = size
-		return nil
-	}
-}
-
 func WithNoLocalSealing(nope bool) NodeOpt {
 	return func(opts *nodeOpts) error {
 		opts.minerNoLocalSealing = nope
@@ -154,6 +201,14 @@ func PresealSectors(sectors int) NodeOpt {
 	}
 }
 
+// NoStorage initializes miners with no writable storage paths (just read-only preseal paths)
+func NoStorage() NodeOpt {
+	return func(opts *nodeOpts) error {
+		opts.noStorage = true
+		return nil
+	}
+}
+
 // ThroughRPC makes interactions with this node throughout the test flow through
 // the JSON-RPC API.
 func ThroughRPC() NodeOpt {
@@ -176,7 +231,7 @@ func OwnerAddr(wk *key.Key) NodeOpt {
 // the node.
 func ConstructorOpts(extra ...node.Option) NodeOpt {
 	return func(opts *nodeOpts) error {
-		opts.extraNodeOpts = extra
+		opts.extraNodeOpts = append(opts.extraNodeOpts, extra...)
 		return nil
 	}
 }
@@ -190,6 +245,23 @@ func MutateSealingConfig(mut func(sc *config.SealingConfig)) NodeOpt {
 				return modules.ToSealingConfig(cf.Dealmaking, cf.Sealing), nil
 			}, nil
 		})))
+}
+
+// F3Enabled enables the F3 feature in the node. If the provided config is nil,
+// the feature is disabled.
+func F3Enabled(cfg *lf3.Config) NodeOpt {
+	if cfg == nil {
+		return ConstructorOpts(
+			node.Unset(new(*lf3.Config)),
+			node.Unset(new(manifest.ManifestProvider)),
+			node.Unset(new(*lf3.F3)),
+		)
+	}
+	return ConstructorOpts(
+		node.Override(new(*lf3.Config), cfg),
+		node.Override(new(manifest.ManifestProvider), lf3.NewManifestProvider),
+		node.Override(new(*lf3.F3), lf3.New),
+	)
 }
 
 // SectorSize sets the sector size for this miner. Start() will populate the
@@ -210,9 +282,89 @@ func WithTaskTypes(tt []sealtasks.TaskType) NodeOpt {
 	}
 }
 
+func WithWorkerName(n string) NodeOpt {
+	return func(opts *nodeOpts) error {
+		opts.workerName = n
+		return nil
+	}
+}
+
+var WithSealWorkerTasks = WithTaskTypes(append([]sealtasks.TaskType{sealtasks.TTAddPiece, sealtasks.TTDataCid, sealtasks.TTPreCommit1, sealtasks.TTPreCommit2, sealtasks.TTCommit2, sealtasks.TTUnseal}, DefaultNodeOpts.workerTasks...))
+
 func WithWorkerStorage(transform func(paths.Store) paths.Store) NodeOpt {
 	return func(opts *nodeOpts) error {
 		opts.workerStorageOpt = transform
 		return nil
 	}
+}
+
+func FsRepo() NodeOpt {
+	return func(opts *nodeOpts) error {
+		opts.fsrepo = true
+		return nil
+	}
+}
+
+func WithCfgOpt(opt CfgOption) NodeOpt {
+	return func(opts *nodeOpts) error {
+		opts.cfgOpts = append(opts.cfgOpts, opt)
+		return nil
+	}
+}
+
+type CfgOption func(cfg *config.FullNode) error
+
+func SplitstoreDiscard() NodeOpt {
+	return WithCfgOpt(func(cfg *config.FullNode) error {
+		cfg.Chainstore.EnableSplitstore = true
+		cfg.Chainstore.Splitstore.HotStoreFullGCFrequency = 0 // turn off full gc
+		cfg.Chainstore.Splitstore.ColdStoreType = "discard"   // no cold store
+		return nil
+	})
+}
+
+func SplitstoreUniversal() NodeOpt {
+	return WithCfgOpt(func(cfg *config.FullNode) error {
+		cfg.Chainstore.EnableSplitstore = true
+		cfg.Chainstore.Splitstore.HotStoreFullGCFrequency = 0 // turn off full gc
+		cfg.Chainstore.Splitstore.ColdStoreType = "universal" // universal bs is coldstore
+		return nil
+	})
+}
+
+func SplitstoreMessges() NodeOpt {
+	return WithCfgOpt(func(cfg *config.FullNode) error {
+		cfg.Chainstore.EnableSplitstore = true
+		cfg.Chainstore.Splitstore.HotStoreFullGCFrequency = 0 // turn off full gc
+		cfg.Chainstore.Splitstore.ColdStoreType = "messages"  // universal bs is coldstore, and it accepts messages
+		return nil
+	})
+}
+
+func SplitstoreDisable() NodeOpt {
+	return WithCfgOpt(func(cfg *config.FullNode) error {
+		cfg.Chainstore.EnableSplitstore = false
+		return nil
+	})
+}
+
+func WithEthRPC() NodeOpt {
+	return WithCfgOpt(func(cfg *config.FullNode) error {
+		cfg.Fevm.EnableEthRPC = true
+		return nil
+	})
+}
+
+func DisableETHBlockCache() NodeOpt {
+	return WithCfgOpt(func(cfg *config.FullNode) error {
+		cfg.Fevm.EthBlkCacheSize = 0
+		return nil
+	})
+}
+
+func DisableEthRPC() NodeOpt {
+	return WithCfgOpt(func(cfg *config.FullNode) error {
+		cfg.Fevm.EnableEthRPC = false
+		return nil
+	})
 }

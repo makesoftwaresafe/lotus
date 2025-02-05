@@ -10,7 +10,7 @@ import (
 
 	"github.com/filecoin-project/go-state-types/abi"
 
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/types"
 )
 
@@ -59,7 +59,7 @@ func (sim *Simulation) makeTipSet(ctx context.Context, messages []*types.Message
 		return nil, xerrors.Errorf("failed to store block messages: %w", err)
 	}
 
-	uts := parentTs.MinTimestamp() + build.BlockDelaySecs
+	uts := parentTs.MinTimestamp() + buildconstants.BlockDelaySecs
 
 	blks := []*types.BlockHeader{{
 		Miner:                 parentTs.MinTicketBlock().Miner, // keep reusing the same miner.
@@ -74,14 +74,17 @@ func (sim *Simulation) makeTipSet(ctx context.Context, messages []*types.Message
 		Timestamp:             uts,
 		ElectionProof:         &types.ElectionProof{WinCount: 1},
 	}}
-	err = sim.Node.Chainstore.PersistBlockHeaders(ctx, blks...)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to persist block headers: %w", err)
-	}
+
 	newTipSet, err := types.NewTipSet(blks)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to create new tipset: %w", err)
 	}
+
+	err = sim.Node.Chainstore.PersistTipsets(ctx, []*types.TipSet{newTipSet})
+	if err != nil {
+		return nil, xerrors.Errorf("failed to persist block headers: %w", err)
+	}
+
 	now := time.Now()
 	_, _, err = sim.StateManager.TipSetState(ctx, newTipSet)
 	if err != nil {

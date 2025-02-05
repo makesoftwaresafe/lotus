@@ -4,14 +4,16 @@ import (
 	"context"
 
 	cbor "github.com/ipfs/go-ipld-cbor"
+	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/manifest"
 	"github.com/filecoin-project/specs-actors/actors/util/adt"
 
 	bstore "github.com/filecoin-project/lotus/blockstore"
 	"github.com/filecoin-project/lotus/chain/actors"
-	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/verifreg"
 	"github.com/filecoin-project/lotus/chain/types"
 )
@@ -28,7 +30,7 @@ func init() {
 	RootVerifierID = idk
 }
 
-func SetupVerifiedRegistryActor(ctx context.Context, bs bstore.Blockstore, av actors.Version) (*types.Actor, error) {
+func SetupVerifiedRegistryActor(ctx context.Context, bs bstore.Blockstore, av actorstypes.Version) (*types.Actor, error) {
 	cst := cbor.NewCborStore(bs)
 	vst, err := verifreg.MakeState(adt.WrapStore(ctx, cbor.NewCborStore(bs)), av, RootVerifierID)
 	if err != nil {
@@ -40,9 +42,9 @@ func SetupVerifiedRegistryActor(ctx context.Context, bs bstore.Blockstore, av ac
 		return nil, err
 	}
 
-	actcid, err := builtin.GetVerifregActorCodeID(av)
-	if err != nil {
-		return nil, err
+	actcid, ok := actors.GetActorCodeID(av, manifest.VerifregKey)
+	if !ok {
+		return nil, xerrors.Errorf("failed to get verifreg actor code ID for actors version %d", av)
 	}
 
 	act := &types.Actor{

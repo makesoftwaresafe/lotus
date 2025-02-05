@@ -16,7 +16,7 @@ import (
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-bitfield"
 	"github.com/filecoin-project/go-state-types/abi"
-	markettypes "github.com/filecoin-project/go-state-types/builtin/v8/market"
+	markettypes "github.com/filecoin-project/go-state-types/builtin/v9/market"
 	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/filecoin-project/go-state-types/exitcode"
 	"github.com/filecoin-project/go-state-types/network"
@@ -80,21 +80,21 @@ func TestGetCurrentDealInfo(t *testing.T) {
 	}
 	successDeal := &api.MarketDeal{
 		Proposal: proposal,
-		State: market.DealState{
+		State: api.MarketDealState{
 			SectorStartEpoch: 1,
 			LastUpdatedEpoch: 2,
 		},
 	}
 	earlierDeal := &api.MarketDeal{
 		Proposal: otherProposal,
-		State: market.DealState{
+		State: api.MarketDealState{
 			SectorStartEpoch: 1,
 			LastUpdatedEpoch: 2,
 		},
 	}
 	anotherDeal := &api.MarketDeal{
 		Proposal: anotherProposal,
-		State: market.DealState{
+		State: api.MarketDealState{
 			SectorStartEpoch: 1,
 			LastUpdatedEpoch: 2,
 		},

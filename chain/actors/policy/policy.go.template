@@ -1,14 +1,13 @@
 package policy
 
 import (
-	"sort"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
 
 	"github.com/filecoin-project/go-state-types/big"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/network"
-	"github.com/filecoin-project/lotus/chain/actors"
 
 	{{range .versions}}
 	{{if (ge . 8)}}
@@ -40,6 +39,10 @@ const (
 	MaxPreCommitRandomnessLookback = builtin{{.latestVersion}}.EpochsInDay + SealRandomnessLookback
 )
 
+var (
+	MarketDefaultAllocationTermBuffer = market{{.latestVersion}}.MarketDefaultAllocationTermBuffer
+)
+
 // SetSupportedProofTypes sets supported proof types, across all actor versions.
 // This should only be used for testing.
 func SetSupportedProofTypes(types ...abi.RegisteredSealProof) {
@@ -50,7 +53,7 @@ func SetSupportedProofTypes(types ...abi.RegisteredSealProof) {
 			miner{{.}}.PreCommitSealProofTypesV0 = make(map[abi.RegisteredSealProof]struct{}, len(types))
 			miner{{.}}.PreCommitSealProofTypesV7 = make(map[abi.RegisteredSealProof]struct{}, len(types)*2)
 			miner{{.}}.PreCommitSealProofTypesV8 = make(map[abi.RegisteredSealProof]struct{}, len(types))
-		{{else}}
+		{{else if (le . 7)}}
 			miner{{.}}.PreCommitSealProofTypesV8 = make(map[abi.RegisteredSealProof]struct{}, len(types))
 		{{end}}
 	{{end}}
@@ -84,7 +87,7 @@ func AddSupportedProofTypes(types ...abi.RegisteredSealProof) {
                 }
 
                 miner{{.}}.WindowPoStProofTypes[wpp] = struct{}{}
-            {{else}}
+            {{else if (le . 7)}}
                 miner{{.}}.PreCommitSealProofTypesV8[t+abi.RegisteredSealProof_StackedDrg2KiBV1_1] = struct{}{}
                 wpp, err = t.RegisteredWindowPoStProof()
                 if err != nil {
@@ -107,8 +110,8 @@ func SetPreCommitChallengeDelay(delay abi.ChainEpoch) {
 	{{end}}
 }
 
-// TODO: this function shouldn't really exist. Instead, the API should expose the precommit delay.
 func GetPreCommitChallengeDelay() abi.ChainEpoch {
+	// TODO: this function shouldn't really exist. Instead, the API should expose the precommit delay.
 	return miner{{.latestVersion}}.PreCommitChallengeDelay
 }
 
@@ -139,10 +142,10 @@ func SetMinVerifiedDealSize(size abi.StoragePower) {
 	{{end}}
 }
 
-func GetMaxProveCommitDuration(ver actors.Version, t abi.RegisteredSealProof) (abi.ChainEpoch, error) {
+func GetMaxProveCommitDuration(ver actorstypes.Version, t abi.RegisteredSealProof) (abi.ChainEpoch, error) {
 	switch ver {
 		{{range .versions}}
-			case actors.Version{{.}}:
+			case actorstypes.Version{{.}}:
 				{{if (eq . 0)}}
 					return miner{{.}}.MaxSealDuration[t], nil
 				{{else}}
@@ -173,13 +176,13 @@ func DealProviderCollateralBounds(
 	rawBytePower, qaPower, baselinePower abi.StoragePower,
 	circulatingFil abi.TokenAmount, nwVer network.Version,
 ) (min, max abi.TokenAmount, err error) {
-	v, err := actors.VersionForNetwork(nwVer)
+	v, err := actorstypes.VersionForNetwork(nwVer)
 	if err != nil {
 		return big.Zero(), big.Zero(), err
 	}
 	switch v {
 		{{range .versions}}
-			case actors.Version{{.}}:
+			case actorstypes.Version{{.}}:
 				{{if (eq . 0)}}
 					min, max := market{{.}}.DealProviderCollateralBounds(size, verified, rawBytePower, qaPower, baselinePower, circulatingFil, nwVer)
 					return min, max, nil
@@ -197,8 +200,8 @@ func DealDurationBounds(pieceSize abi.PaddedPieceSize) (min, max abi.ChainEpoch)
 	return market{{.latestVersion}}.DealDurationBounds(pieceSize)
 }
 
-// Sets the challenge window and scales the proving period to match (such that
-// there are always 48 challenge windows in a proving period).
+// SetWPoStChallengeWindow sets the challenge window and scales the proving period to match (such
+// that there are always 48 challenge windows in a proving period).
 func SetWPoStChallengeWindow(period abi.ChainEpoch) {
 	{{range .versions}}
 		miner{{.}}.WPoStChallengeWindow = period
@@ -220,8 +223,20 @@ func GetWinningPoStSectorSetLookback(nwVer network.Version) abi.ChainEpoch {
 	return ChainFinality
 }
 
-func GetMaxSectorExpirationExtension() abi.ChainEpoch {
-	return miner{{.latestVersion}}.MaxSectorExpirationExtension
+func GetMaxSectorExpirationExtension(nv network.Version) (abi.ChainEpoch, error) {
+	v, err := actorstypes.VersionForNetwork(nv)
+	if err != nil {
+		return 0, xerrors.Errorf("failed to get actors version: %w", err)
+	}
+	switch v {
+		{{range .versions}}
+			case actorstypes.Version{{.}}:
+				return miner{{.}}.MaxSectorExpirationExtension, nil
+		{{end}}
+	default:
+		return 0, xerrors.Errorf("unsupported network version")
+	}
+
 }
 
 func GetMinSectorExpiration() abi.ChainEpoch {
@@ -237,26 +252,8 @@ func GetMaxPoStPartitions(nv network.Version, p abi.RegisteredPoStProof) (int, e
 	if err != nil {
 		return 0, err
 	}
-	return int(uint64(maxSectors) / sectorsPerPart), nil
-}
 
-func GetDefaultSectorSize() abi.SectorSize {
-	// supported sector sizes are the same across versions.
-	szs := make([]abi.SectorSize, 0, len(miner{{.latestVersion}}.PreCommitSealProofTypesV8))
-	for spt := range miner{{.latestVersion}}.PreCommitSealProofTypesV8 {
-		ss, err := spt.SectorSize()
-		if err != nil {
-			panic(err)
-		}
-
-		szs = append(szs, ss)
-	}
-
-	sort.Slice(szs, func(i, j int) bool {
-		return szs[i] < szs[j]
-	})
-
-	return szs[0]
+	return min(miner{{.latestVersion}}.PoStedPartitionsMax, int(uint64(maxSectors) / sectorsPerPart)), nil
 }
 
 func GetDefaultAggregationProof() abi.RegisteredAggregationProof {
@@ -272,13 +269,13 @@ func GetSectorMaxLifetime(proof abi.RegisteredSealProof, nwVer network.Version) 
 }
 
 func GetAddressedSectorsMax(nwVer network.Version) (int, error) {
-	v, err := actors.VersionForNetwork(nwVer)
+	v, err := actorstypes.VersionForNetwork(nwVer)
 	if err != nil {
 		return 0, err
 	}
 	switch v {
 		{{range .versions}}
-			case actors.Version{{.}}:
+			case actorstypes.Version{{.}}:
 				return miner{{.}}.AddressedSectorsMax, nil
 		{{end}}
 	default:
@@ -287,13 +284,13 @@ func GetAddressedSectorsMax(nwVer network.Version) (int, error) {
 }
 
 func GetDeclarationsMax(nwVer network.Version) (int, error) {
-	v, err := actors.VersionForNetwork(nwVer)
+	v, err := actorstypes.VersionForNetwork(nwVer)
 	if err != nil {
 		return 0, err
 	}
 	switch v {
 		{{range .versions}}
-		case actors.Version{{.}}:
+		case actorstypes.Version{{.}}:
 			{{if (eq . 0)}}
 				// TODO: Should we instead error here since the concept doesn't exist yet?
 				return miner{{.}}.AddressedPartitionsMax, nil
@@ -307,13 +304,13 @@ func GetDeclarationsMax(nwVer network.Version) (int, error) {
 }
 
 func AggregateProveCommitNetworkFee(nwVer network.Version, aggregateSize int, baseFee abi.TokenAmount) (abi.TokenAmount, error) {
-   v, err := actors.VersionForNetwork(nwVer)
+   v, err := actorstypes.VersionForNetwork(nwVer)
 	if err != nil {
 		return big.Zero(), err
 	}
 	switch v {
 	    {{range .versions}}
-	    case actors.Version{{.}}:
+	    case actorstypes.Version{{.}}:
             {{if (ge . 6)}}
                 return miner{{.}}.AggregateProveCommitNetworkFee(aggregateSize, baseFee), nil
             {{else if (eq . 5)}}
@@ -328,13 +325,13 @@ func AggregateProveCommitNetworkFee(nwVer network.Version, aggregateSize int, ba
 }
 
 func AggregatePreCommitNetworkFee(nwVer network.Version, aggregateSize int, baseFee abi.TokenAmount) (abi.TokenAmount, error) {
-   v, err := actors.VersionForNetwork(nwVer)
+   v, err := actorstypes.VersionForNetwork(nwVer)
 	if err != nil {
 		return big.Zero(), err
 	}
 	switch v {
 	    {{range .versions}}
-	    case actors.Version{{.}}:
+	    case actorstypes.Version{{.}}:
             {{if (ge . 6)}}
                 return miner{{.}}.AggregatePreCommitNetworkFee(aggregateSize, baseFee), nil
             {{else}}
@@ -344,4 +341,28 @@ func AggregatePreCommitNetworkFee(nwVer network.Version, aggregateSize int, base
 	default:
 		return big.Zero(), xerrors.Errorf("unsupported network version")
 	}
+}
+
+var PoStToSealMap map[abi.RegisteredPoStProof]abi.RegisteredSealProof
+func init() {
+	PoStToSealMap = make(map[abi.RegisteredPoStProof]abi.RegisteredSealProof)
+	for sealProof, info := range abi.SealProofInfos {
+		PoStToSealMap[info.WinningPoStProof] = sealProof
+		PoStToSealMap[info.WindowPoStProof] = sealProof
+	}
+}
+
+func GetSealProofFromPoStProof(postProof abi.RegisteredPoStProof) (abi.RegisteredSealProof, error) {
+	sealProof, exists := PoStToSealMap[postProof]
+	if !exists {
+		return 0, xerrors.New("no corresponding RegisteredSealProof for the given RegisteredPoStProof")
+	}
+	return sealProof, nil
+}
+
+func min(a, b int) int {
+    if a < b {
+        return a
+    }
+    return b
 }

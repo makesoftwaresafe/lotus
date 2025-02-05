@@ -3,16 +3,22 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/docker/go-units"
+	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	ipldcbor "github.com/ipfs/go-ipld-cbor"
 	"github.com/mitchellh/go-homedir"
 	"github.com/urfave/cli/v2"
+	cbg "github.com/whyrusleeping/cbor-gen"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
@@ -20,15 +26,20 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/builtin"
+	"github.com/filecoin-project/go-state-types/builtin/v11/util/adt"
+	miner15 "github.com/filecoin-project/go-state-types/builtin/v15/miner"
 	miner8 "github.com/filecoin-project/go-state-types/builtin/v8/miner"
 	"github.com/filecoin-project/go-state-types/crypto"
+	"github.com/filecoin-project/go-state-types/manifest"
 	power7 "github.com/filecoin-project/specs-actors/v7/actors/builtin/power"
 	"github.com/filecoin-project/specs-actors/v7/actors/runtime/proof"
 
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/api/v0api"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/power"
+	"github.com/filecoin-project/lotus/chain/state"
 	"github.com/filecoin-project/lotus/chain/types"
 	lcli "github.com/filecoin-project/lotus/cli"
 )
@@ -42,6 +53,95 @@ var minerCmd = &cli.Command{
 		minerFaultsCmd,
 		sendInvalidWindowPoStCmd,
 		generateAndSendConsensusFaultCmd,
+		sectorInfoCmd,
+		minerLockedVestedCmd,
+		minerListVestingCmd,
+	},
+}
+
+var _ ipldcbor.IpldBlockstore = new(ReadOnlyAPIBlockstore)
+
+type ReadOnlyAPIBlockstore struct {
+	v0api.FullNode
+}
+
+func (b *ReadOnlyAPIBlockstore) Get(ctx context.Context, c cid.Cid) (block.Block, error) {
+	bs, err := b.ChainReadObj(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	return block.NewBlock(bs), nil
+}
+
+func (b *ReadOnlyAPIBlockstore) Put(context.Context, block.Block) error {
+	return xerrors.Errorf("cannot put block, the backing blockstore is readonly")
+}
+
+var sectorInfoCmd = &cli.Command{
+	Name:      "sectorinfo",
+	Usage:     "Display cbor of sector info at <minerAddress> <sectorNumber>",
+	ArgsUsage: "[minerAddress] [sector number]",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "tipset",
+			Usage: "specify tipset to call method on (pass comma separated array of cids)",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		if cctx.Args().Len() != 2 {
+			return fmt.Errorf("must pass miner address and sector number")
+		}
+		ctx := lcli.ReqContext(cctx)
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+		maddr, err := address.NewFromString(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+		sn, err := strconv.ParseUint(cctx.Args().Slice()[1], 10, 64)
+		if err != nil {
+			return err
+		}
+
+		ts, err := lcli.LoadTipSet(ctx, cctx, api)
+		if err != nil {
+			return err
+		}
+		a, err := api.StateReadState(ctx, maddr, ts.Key())
+		if err != nil {
+			return err
+		}
+		st, ok := a.State.(map[string]interface{})
+		if !ok {
+			return xerrors.Errorf("failed to cast state map to expected form")
+		}
+		sectorsRaw, ok := st["Sectors"].(map[string]interface{})
+		if !ok {
+			return xerrors.Errorf("failed to read sectors root from state")
+		}
+		// string is of the form "/:bafy.." so [2:] to drop the path
+		sectorsRoot, err := cid.Parse(sectorsRaw["/"])
+		if err != nil {
+			return err
+		}
+		bs := ReadOnlyAPIBlockstore{api}
+		sectorsAMT, err := adt.AsArray(adt.WrapStore(ctx, ipldcbor.NewCborStore(&bs)), sectorsRoot, miner8.SectorsAmtBitwidth)
+		if err != nil {
+			return err
+		}
+		out := cbg.Deferred{}
+		found, err := sectorsAMT.Get(sn, &out)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return xerrors.Errorf("sector number %d not found", sn)
+		}
+		fmt.Printf("%x\n", out.Raw)
+		return nil
 	},
 }
 
@@ -126,6 +226,13 @@ var minerCreateCmd = &cli.Command{
 	Name:      "create",
 	Usage:     "sends a create miner message",
 	ArgsUsage: "[sender] [owner] [worker] [sector size]",
+	Flags: []cli.Flag{
+		&cli.IntFlag{
+			Name:  "confidence",
+			Usage: "number of block confirmations to wait for",
+			Value: int(buildconstants.MessageConfidence),
+		},
+	},
 	Action: func(cctx *cli.Context) error {
 		wapi, closer, err := lcli.GetFullNodeAPI(cctx)
 		if err != nil {
@@ -135,8 +242,8 @@ var minerCreateCmd = &cli.Command{
 		defer closer()
 		ctx := lcli.ReqContext(cctx)
 
-		if cctx.Args().Len() != 4 {
-			return xerrors.Errorf("expected 4 args (sender owner worker sectorSize)")
+		if cctx.NArg() != 4 {
+			return lcli.IncorrectNumArgs(cctx)
 		}
 
 		sender, err := address.NewFromString(cctx.Args().First())
@@ -180,7 +287,7 @@ var minerCreateCmd = &cli.Command{
 			log.Infof("Initializing worker account %s, message: %s", worker, signed.Cid())
 			log.Infof("Waiting for confirmation")
 
-			mw, err := wapi.StateWaitMsg(ctx, signed.Cid(), build.MessageConfidence)
+			mw, err := wapi.StateWaitMsg(ctx, signed.Cid(), uint64(cctx.Int("confidence")))
 			if err != nil {
 				return xerrors.Errorf("waiting for worker init: %w", err)
 			}
@@ -205,7 +312,7 @@ var minerCreateCmd = &cli.Command{
 			log.Infof("Initializing owner account %s, message: %s", worker, signed.Cid())
 			log.Infof("Wating for confirmation")
 
-			mw, err := wapi.StateWaitMsg(ctx, signed.Cid(), build.MessageConfidence)
+			mw, err := wapi.StateWaitMsg(ctx, signed.Cid(), buildconstants.MessageConfidence)
 			if err != nil {
 				return xerrors.Errorf("waiting for owner init: %w", err)
 			}
@@ -216,7 +323,11 @@ var minerCreateCmd = &cli.Command{
 		}
 
 		// Note: the correct thing to do would be to call SealProofTypeFromSectorSize if actors version is v3 or later, but this still works
-		spt, err := miner.WindowPoStProofTypeFromSectorSize(abi.SectorSize(ssize))
+		nv, err := wapi.StateNetworkVersion(ctx, types.EmptyTSK)
+		if err != nil {
+			return xerrors.Errorf("failed to get network version: %w", err)
+		}
+		spt, err := miner.WindowPoStProofTypeFromSectorSize(abi.SectorSize(ssize), nv)
 		if err != nil {
 			return xerrors.Errorf("getting post proof type: %w", err)
 		}
@@ -248,7 +359,7 @@ var minerCreateCmd = &cli.Command{
 		log.Infof("Pushed CreateMiner message: %s", signed.Cid())
 		log.Infof("Waiting for confirmation")
 
-		mw, err := wapi.StateWaitMsg(ctx, signed.Cid(), build.MessageConfidence)
+		mw, err := wapi.StateWaitMsg(ctx, signed.Cid(), buildconstants.MessageConfidence)
 		if err != nil {
 			return xerrors.Errorf("waiting for createMiner message: %w", err)
 		}
@@ -273,8 +384,8 @@ var minerUnpackInfoCmd = &cli.Command{
 	Usage:     "unpack miner info all dump",
 	ArgsUsage: "[allinfo.txt] [dir]",
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 2 {
-			return xerrors.Errorf("expected 2 args")
+		if cctx.NArg() != 2 {
+			return lcli.IncorrectNumArgs(cctx)
 		}
 
 		src, err := homedir.Expand(cctx.Args().Get(0))
@@ -455,7 +566,7 @@ var sendInvalidWindowPoStCmd = &cli.Command{
 			return xerrors.Errorf("serializing params: %w", err)
 		}
 
-		fmt.Printf("submitting bad PoST for %d paritions\n", len(partitionIndices))
+		fmt.Printf("submitting bad PoST for %d partitions\n", len(partitionIndices))
 		smsg, err := api.MpoolPushMessage(ctx, &types.Message{
 			From:   minfo.Worker,
 			To:     maddr,
@@ -475,7 +586,7 @@ var sendInvalidWindowPoStCmd = &cli.Command{
 		}
 
 		// check it executed successfully
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			fmt.Println(cctx.App.Writer, "Invalid PoST message failed!")
 			return err
 		}
@@ -488,9 +599,10 @@ var generateAndSendConsensusFaultCmd = &cli.Command{
 	Name:        "generate-and-send-consensus-fault",
 	Usage:       "Provided a block CID mined by the miner, will create another block at the same height, and send both block headers to generate a consensus fault.",
 	Description: `Note: This is meant for testing purposes and should NOT be used on mainnet or you will be slashed`,
+	ArgsUsage:   "blockCID",
 	Action: func(cctx *cli.Context) error {
 		if cctx.NArg() != 1 {
-			return xerrors.Errorf("expected 1 arg (blockCID)")
+			return lcli.IncorrectNumArgs(cctx)
 		}
 
 		blockCid, err := cid.Parse(cctx.Args().First())
@@ -574,11 +686,184 @@ var generateAndSendConsensusFaultCmd = &cli.Command{
 		}
 
 		// check it executed successfully
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			fmt.Println(cctx.App.Writer, "Report consensus fault failed!")
 			return err
 		}
 
+		return nil
+	},
+}
+
+// TODO: LoadVestingFunds isn't exposed on the miner wrappers in Lotus so we have to go decoding the
+// miner state manually. This command will continue to work as long as the hard-coded go-state-types
+// miner version matches the schema of the current miner actor. It will need to be updated if the
+// miner actor schema changes; or we could expose LoadVestingFunds.
+var minerLockedVestedCmd = &cli.Command{
+	Name:  "locked-vested",
+	Usage: "Search through all miners for VestingFunds that are still locked even though the epoch has passed",
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "details",
+			Usage: "orint details of locked funds; which miners and how much",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		n, acloser, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer acloser()
+		ctx := lcli.ReqContext(cctx)
+
+		bs := ReadOnlyAPIBlockstore{n}
+		adtStore := adt.WrapStore(ctx, ipldcbor.NewCborStore(&bs))
+
+		head, err := n.ChainHead(ctx)
+		if err != nil {
+			return err
+		}
+
+		tree, err := state.LoadStateTree(adtStore, head.ParentState())
+		if err != nil {
+			return err
+		}
+		nv, err := n.StateNetworkVersion(ctx, head.Key())
+		if err != nil {
+			return err
+		}
+		actorCodeCids, err := n.StateActorCodeCIDs(ctx, nv)
+		if err != nil {
+			return err
+		}
+		minerCode := actorCodeCids[manifest.MinerKey]
+
+		// The epoch at which we _expect_ that vested funds to have been unlocked by (the delay
+		// is due to cron offsets). The protocol dictates that funds should be unlocked automatically
+		// by cron, so anything we find that's not unlocked is a bug.
+		staleEpoch := head.Height() - abi.ChainEpoch((uint64(miner15.WPoStProvingPeriod) / miner15.WPoStPeriodDeadlines))
+
+		var totalCount int
+		miners := make(map[address.Address]abi.TokenAmount)
+		var lockedCount int
+		var lockedFunds abi.TokenAmount = big.Zero()
+		_, _ = fmt.Fprintf(cctx.App.ErrWriter, "Scanning actors at epoch %d", head.Height())
+		err = tree.ForEach(func(addr address.Address, act *types.Actor) error {
+			totalCount++
+			if totalCount%10000 == 0 {
+				_, _ = fmt.Fprintf(cctx.App.ErrWriter, ".")
+			}
+			if act.Code == minerCode {
+				m15 := miner15.State{}
+				if err := adtStore.Get(ctx, act.Head, &m15); err != nil {
+					return xerrors.Errorf("failed to load miner state (using miner15, try a newer version?): %w", err)
+				}
+				vf, err := m15.LoadVestingFunds(adtStore)
+				if err != nil {
+					return err
+				}
+				var locked bool
+				for _, f := range vf.Funds {
+					if f.Epoch < staleEpoch {
+						if _, ok := miners[addr]; !ok {
+							miners[addr] = f.Amount
+						} else {
+							miners[addr] = big.Add(miners[addr], f.Amount)
+						}
+						lockedFunds = big.Add(lockedFunds, f.Amount)
+						locked = true
+					}
+				}
+				if locked {
+					lockedCount++
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return xerrors.Errorf("failed to loop over actors: %w", err)
+		}
+
+		fmt.Println()
+		_, _ = fmt.Fprintf(cctx.App.Writer, "Total actors: %d\n", totalCount)
+		_, _ = fmt.Fprintf(cctx.App.Writer, "Total miners: %d\n", len(miners))
+		_, _ = fmt.Fprintf(cctx.App.Writer, "Miners with locked vested funds: %d\n", lockedCount)
+		if cctx.Bool("details") {
+			for addr, amt := range miners {
+				_, _ = fmt.Fprintf(cctx.App.Writer, "  %s: %s\n", addr, types.FIL(amt))
+			}
+		}
+		_, _ = fmt.Fprintf(cctx.App.Writer, "Total locked vested funds: %s\n", types.FIL(lockedFunds))
+
+		return nil
+	},
+}
+
+var minerListVestingCmd = &cli.Command{
+	Name:      "list-vesting",
+	Usage:     "List the vesting schedule for a miner",
+	ArgsUsage: "[minerAddress]",
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "json",
+			Usage: "output in json format (also don't convert from attoFIL to FIL)",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		if cctx.Args().Len() != 1 {
+			return fmt.Errorf("must pass miner address")
+		}
+
+		maddr, err := address.NewFromString(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		n, acloser, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer acloser()
+		ctx := lcli.ReqContext(cctx)
+
+		bs := ReadOnlyAPIBlockstore{n}
+		adtStore := adt.WrapStore(ctx, ipldcbor.NewCborStore(&bs))
+
+		head, err := n.ChainHead(ctx)
+		if err != nil {
+			return err
+		}
+
+		tree, err := state.LoadStateTree(adtStore, head.ParentState())
+		if err != nil {
+			return err
+		}
+
+		act, err := tree.GetActor(maddr)
+		if err != nil {
+			return xerrors.Errorf("failed to load actor: %w", err)
+		}
+
+		m15 := miner15.State{}
+		if err := adtStore.Get(ctx, act.Head, &m15); err != nil {
+			return xerrors.Errorf("failed to load miner state (using miner15, try a newer version?): %w", err)
+		}
+		vf, err := m15.LoadVestingFunds(adtStore)
+		if err != nil {
+			return err
+		}
+
+		if cctx.Bool("json") {
+			jb, err := json.Marshal(vf)
+			if err != nil {
+				return xerrors.Errorf("failed to marshal vesting funds: %w", err)
+			}
+			_, _ = fmt.Fprintln(cctx.App.Writer, string(jb))
+		} else {
+			for _, f := range vf.Funds {
+				_, _ = fmt.Fprintf(cctx.App.Writer, "Epoch %d: %s\n", f.Epoch, types.FIL(f.Amount))
+			}
+		}
 		return nil
 	},
 }

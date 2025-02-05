@@ -11,7 +11,7 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/builtin"
-	minertypes "github.com/filecoin-project/go-state-types/builtin/v8/miner"
+	minertypes "github.com/filecoin-project/go-state-types/builtin/v9/miner"
 	"github.com/filecoin-project/go-state-types/network"
 	miner5 "github.com/filecoin-project/specs-actors/v5/actors/builtin/miner"
 
@@ -54,7 +54,7 @@ func (*PreCommitStage) Name() string {
 	return "pre-commit"
 }
 
-// packPreCommits packs pre-commit messages until the block is full.
+// PackMessages packs pre-commit messages until the block is full.
 func (stage *PreCommitStage) PackMessages(ctx context.Context, bb *blockbuilder.BlockBuilder) (_err error) {
 	if !stage.initialized {
 		if err := stage.load(ctx, bb); err != nil {
@@ -124,7 +124,7 @@ func (stage *PreCommitStage) PackMessages(ctx context.Context, bb *blockbuilder.
 	}
 }
 
-// packPreCommitsMiner packs count pre-commits for the given miner.
+// packMiner packs count pre-commits for the given miner.
 func (stage *PreCommitStage) packMiner(
 	ctx context.Context, bb *blockbuilder.BlockBuilder,
 	minerAddr address.Address, count int,
@@ -165,7 +165,7 @@ func (stage *PreCommitStage) packMiner(
 
 	// Generate pre-commits.
 	sealType, err := miner.PreferredSealProofTypeFromWindowPoStType(
-		nv, minerInfo.WindowPoStProofType,
+		nv, minerInfo.WindowPoStProofType, false,
 	)
 	if err != nil {
 		return 0, false, err
@@ -176,10 +176,15 @@ func (stage *PreCommitStage) packMiner(
 		return 0, false, err
 	}
 
-	expiration := epoch + policy.GetMaxSectorExpirationExtension()
-	infos := make([]minertypes.SectorPreCommitInfo, len(sectorNos))
+	maxExtension, err := policy.GetMaxSectorExpirationExtension(nv)
+	if err != nil {
+		return 0, false, xerrors.Errorf("failed to get max extension: %w", err)
+	}
+
+	expiration := epoch + maxExtension
+	infos := make([]minertypes.PreCommitSectorParams, len(sectorNos))
 	for i, sno := range sectorNos {
-		infos[i] = minertypes.SectorPreCommitInfo{
+		infos[i] = minertypes.PreCommitSectorParams{
 			SealProof:     sealType,
 			SectorNumber:  sno,
 			SealedCID:     mock.MockCommR(minerAddr, sno),
@@ -228,7 +233,7 @@ func (stage *PreCommitStage) packMiner(
 			}
 
 			for _, info := range batch {
-				if err := stage.committer.EnqueueProveCommit(minerAddr, epoch, info); err != nil {
+				if err := stage.committer.EnqueueProveCommit(minerAddr, epoch, toSectorPreCommitInfo(info)); err != nil {
 					return added, false, err
 				}
 				added++
@@ -253,7 +258,7 @@ func (stage *PreCommitStage) packMiner(
 			return added, false, err
 		}
 
-		if err := stage.committer.EnqueueProveCommit(minerAddr, epoch, info); err != nil {
+		if err := stage.committer.EnqueueProveCommit(minerAddr, epoch, toSectorPreCommitInfo(info)); err != nil {
 			return added, false, err
 		}
 		added++
@@ -308,7 +313,7 @@ func (stage *PreCommitStage) load(ctx context.Context, bb *blockbuilder.BlockBui
 			sealList = append(sealList, onboardingInfo{addr, uint64(sectorCount)})
 		}
 		return nil
-	})
+	}, false)
 	if err != nil {
 		return err
 	}
@@ -345,4 +350,16 @@ func (stage *PreCommitStage) load(ctx context.Context, bb *blockbuilder.BlockBui
 
 	stage.initialized = true
 	return nil
+}
+
+func toSectorPreCommitInfo(param minertypes.PreCommitSectorParams) minertypes.SectorPreCommitInfo {
+	return minertypes.SectorPreCommitInfo{
+		SealProof:     param.SealProof,
+		SectorNumber:  param.SectorNumber,
+		SealedCID:     param.SealedCID,
+		SealRandEpoch: param.SealRandEpoch,
+		DealIDs:       param.DealIDs,
+		Expiration:    param.Expiration,
+		UnsealedCid:   nil,
+	}
 }

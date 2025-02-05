@@ -84,13 +84,19 @@ func Unset(typ interface{}) Option {
 	}
 }
 
-// From(*T) -> func(t T) T {return t}
+// From (*T) -> func(t T) T {return t}
 func From(typ interface{}) interface{} {
 	rt := []reflect.Type{reflect.TypeOf(typ).Elem()}
 	ft := reflect.FuncOf(rt, rt, false)
 	return reflect.MakeFunc(ft, func(args []reflect.Value) (results []reflect.Value) {
 		return args
 	}).Interface()
+}
+
+func FromVal[T any](v T) func() T {
+	return func() T {
+		return v
+	}
 }
 
 // from go-ipfs

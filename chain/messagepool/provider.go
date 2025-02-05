@@ -2,18 +2,23 @@ package messagepool
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/ipfs/go-cid"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/network"
 
-	"github.com/filecoin-project/lotus/chain/messagesigner"
 	"github.com/filecoin-project/lotus/chain/stmgr"
 	"github.com/filecoin-project/lotus/chain/store"
 	"github.com/filecoin-project/lotus/chain/types"
+	"github.com/filecoin-project/lotus/lib/must"
+	"github.com/filecoin-project/lotus/lib/result"
 )
 
 var (
@@ -26,8 +31,10 @@ type Provider interface {
 	SubscribeHeadChanges(func(rev, app []*types.TipSet) error) *types.TipSet
 	PutMessage(ctx context.Context, m types.ChainMsg) (cid.Cid, error)
 	PubSubPublish(string, []byte) error
+	GetActorBefore(address.Address, *types.TipSet) (*types.Actor, error)
 	GetActorAfter(address.Address, *types.TipSet) (*types.Actor, error)
-	StateAccountKeyAtFinality(context.Context, address.Address, *types.TipSet) (address.Address, error)
+	StateDeterministicAddressAtFinality(context.Context, address.Address, *types.TipSet) (address.Address, error)
+	StateNetworkVersion(context.Context, abi.ChainEpoch) network.Version
 	MessagesForBlock(context.Context, *types.BlockHeader) ([]*types.Message, []*types.SignedMessage, error)
 	MessagesForTipset(context.Context, *types.TipSet) ([]types.ChainMsg, error)
 	LoadTipSet(ctx context.Context, tsk types.TipSetKey) (*types.TipSet, error)
@@ -35,11 +42,20 @@ type Provider interface {
 	IsLite() bool
 }
 
+type actorCacheKey struct {
+	types.TipSetKey
+	address.Address
+}
+
+var nonceCacheSize = 128
+
 type mpoolProvider struct {
 	sm *stmgr.StateManager
 	ps *pubsub.PubSub
 
-	lite messagesigner.MpoolNonceAPI
+	liteActorCache *lru.Cache[actorCacheKey, result.Result[*types.Actor]]
+
+	lite MpoolNonceAPI
 }
 
 var _ Provider = (*mpoolProvider)(nil)
@@ -48,12 +64,42 @@ func NewProvider(sm *stmgr.StateManager, ps *pubsub.PubSub) Provider {
 	return &mpoolProvider{sm: sm, ps: ps}
 }
 
-func NewProviderLite(sm *stmgr.StateManager, ps *pubsub.PubSub, noncer messagesigner.MpoolNonceAPI) Provider {
-	return &mpoolProvider{sm: sm, ps: ps, lite: noncer}
+func NewProviderLite(sm *stmgr.StateManager, ps *pubsub.PubSub, noncer MpoolNonceAPI) Provider {
+	return &mpoolProvider{
+		sm:             sm,
+		ps:             ps,
+		lite:           noncer,
+		liteActorCache: must.One(lru.New[actorCacheKey, result.Result[*types.Actor]](nonceCacheSize)),
+	}
 }
 
 func (mpp *mpoolProvider) IsLite() bool {
 	return mpp.lite != nil
+}
+
+func (mpp *mpoolProvider) getActorLite(addr address.Address, ts *types.TipSet) (act *types.Actor, err error) {
+	if !mpp.IsLite() {
+		return nil, errors.New("should not use getActorLite on non lite Provider")
+	}
+
+	if c, ok := mpp.liteActorCache.Get(actorCacheKey{ts.Key(), addr}); ok {
+		return c.Unwrap()
+	}
+
+	defer func() {
+		mpp.liteActorCache.Add(actorCacheKey{ts.Key(), addr}, result.Wrap(act, err))
+	}()
+
+	n, err := mpp.lite.GetNonce(context.TODO(), addr, ts.Key())
+	if err != nil {
+		return nil, xerrors.Errorf("getting nonce over lite: %w", err)
+	}
+	a, err := mpp.lite.GetActor(context.TODO(), addr, ts.Key())
+	if err != nil {
+		return nil, xerrors.Errorf("getting actor over lite: %w", err)
+	}
+	a.Nonce = n
+	return a, nil
 }
 
 func (mpp *mpoolProvider) SubscribeHeadChanges(cb func(rev, app []*types.TipSet) error) *types.TipSet {
@@ -72,21 +118,20 @@ func (mpp *mpoolProvider) PutMessage(ctx context.Context, m types.ChainMsg) (cid
 }
 
 func (mpp *mpoolProvider) PubSubPublish(k string, v []byte) error {
-	return mpp.ps.Publish(k, v) //nolint
+	return mpp.ps.Publish(k, v) // nolint
+}
+
+func (mpp *mpoolProvider) GetActorBefore(addr address.Address, ts *types.TipSet) (*types.Actor, error) {
+	if mpp.IsLite() {
+		return mpp.getActorLite(addr, ts)
+	}
+
+	return mpp.sm.LoadActor(context.TODO(), addr, ts)
 }
 
 func (mpp *mpoolProvider) GetActorAfter(addr address.Address, ts *types.TipSet) (*types.Actor, error) {
 	if mpp.IsLite() {
-		n, err := mpp.lite.GetNonce(context.TODO(), addr, ts.Key())
-		if err != nil {
-			return nil, xerrors.Errorf("getting nonce over lite: %w", err)
-		}
-		a, err := mpp.lite.GetActor(context.TODO(), addr, ts.Key())
-		if err != nil {
-			return nil, xerrors.Errorf("getting actor over lite: %w", err)
-		}
-		a.Nonce = n
-		return a, nil
+		return mpp.getActorLite(addr, ts)
 	}
 
 	stcid, _, err := mpp.sm.TipSetState(context.TODO(), ts)
@@ -100,8 +145,12 @@ func (mpp *mpoolProvider) GetActorAfter(addr address.Address, ts *types.TipSet) 
 	return st.GetActor(addr)
 }
 
-func (mpp *mpoolProvider) StateAccountKeyAtFinality(ctx context.Context, addr address.Address, ts *types.TipSet) (address.Address, error) {
-	return mpp.sm.ResolveToKeyAddressAtFinality(ctx, addr, ts)
+func (mpp *mpoolProvider) StateDeterministicAddressAtFinality(ctx context.Context, addr address.Address, ts *types.TipSet) (address.Address, error) {
+	return mpp.sm.ResolveToDeterministicAddressAtFinality(ctx, addr, ts)
+}
+
+func (mpp *mpoolProvider) StateNetworkVersion(ctx context.Context, height abi.ChainEpoch) network.Version {
+	return mpp.sm.GetNetworkVersion(ctx, height)
 }
 
 func (mpp *mpoolProvider) MessagesForBlock(ctx context.Context, h *types.BlockHeader) ([]*types.Message, []*types.SignedMessage, error) {

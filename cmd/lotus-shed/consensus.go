@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/urfave/cli/v2"
 
@@ -17,7 +17,7 @@ import (
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/api/client"
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/build/buildconstants"
 	"github.com/filecoin-project/lotus/chain/types"
 	lcli "github.com/filecoin-project/lotus/cli"
 	cliutil "github.com/filecoin-project/lotus/cli/util"
@@ -76,7 +76,7 @@ var consensusCheckCmd = &cli.Command{
 		},
 		&cli.IntFlag{
 			Name:  "lookback",
-			Value: int(build.MessageConfidence * 2),
+			Value: int(buildconstants.MessageConfidence * 2),
 			Usage: "number of tipsets behind to look back when comparing nodes",
 		},
 	},
@@ -84,7 +84,7 @@ var consensusCheckCmd = &cli.Command{
 		filePath := cctx.Args().First()
 
 		var input *bufio.Reader
-		if cctx.Args().Len() == 0 {
+		if cctx.NArg() == 0 {
 			input = bufio.NewReader(os.Stdin)
 		} else {
 			var err error
@@ -205,7 +205,7 @@ var consensusCheckCmd = &cli.Command{
 			tnow := uint64(time.Now().Unix())
 			tgen := nodes[0].genesisTipset.MinTimestamp()
 
-			target = abi.ChainEpoch((tnow - tgen) / build.BlockDelaySecs)
+			target = abi.ChainEpoch((tnow - tgen) / buildconstants.BlockDelaySecs)
 		default:
 			h, err := strconv.Atoi(strings.TrimSpace(cctx.String("height")))
 			if err != nil {

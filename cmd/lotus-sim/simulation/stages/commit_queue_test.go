@@ -1,4 +1,3 @@
-//stm: #unit
 package stages
 
 import (
@@ -8,13 +7,12 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
-	minertypes "github.com/filecoin-project/go-state-types/builtin/v8/miner"
+	minertypes "github.com/filecoin-project/go-state-types/builtin/v9/miner"
 
 	"github.com/filecoin-project/lotus/chain/actors/policy"
 )
 
 func TestCommitQueue(t *testing.T) {
-	//stm: @CMD_COMMIT_Q_ENQUEUE_COMMIT_001
 	var q commitQueue
 	addr1, err := address.NewIDAddress(1000)
 	require.NoError(t, err)
@@ -48,7 +46,6 @@ func TestCommitQueue(t *testing.T) {
 		SectorNumber: 6,
 	}))
 
-	//stm: @CMD_COMMIT_Q_ADVANCE_EPOCH_001, @CMD_COMMIT_Q_NEXT_MINER_001
 	epoch := abi.ChainEpoch(0)
 	q.advanceEpoch(epoch)
 	_, _, ok := q.nextMiner()
